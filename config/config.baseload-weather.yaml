@@ -1,0 +1,67 @@
+# SPDX-FileCopyrightText: Contributors to PyPSA-Eur <https://github.com/pypsa/pypsa-eur>
+# SPDX-License-Identifier: CC0-1.0
+
+# Overrides config/config.yaml for the 2045 baseload-value experiment.
+run:
+  name: [weather-2010, weather-2013, weather-2018]
+  scenarios:
+    enable: true
+    file: config/scenarios.baseload-weather.yaml
+  shared_resources:
+    policy: false
+  shared_cutouts: false
+
+foresight: overnight
+scenario:
+  clusters: [128]
+  opts: ['']
+  sector_opts: ['']
+  planning_horizons: [2045]
+
+costs:
+  year: 2045
+
+co2_budget:
+  2045: 0.050
+
+sector:
+  v2g: true
+
+load:
+  fixed_year: 2013
+
+clustering:
+  temporal:
+    resolution_elec: false
+    resolution_sector: 3h
+
+enable:
+  build_cutout: true
+  retrieve_cutout: false
+
+atlite:
+  cutouts:
+    europe-2010-sarah3-era5:
+      module: [sarah, era5]
+      x: [-12., 42.]
+      y: [33., 72.]
+      dx: 0.3
+      dy: 0.3
+      time: ['2010', '2010']
+    europe-2018-sarah3-era5:
+      module: [sarah, era5]
+      x: [-12., 42.]
+      y: [33., 72.]
+      dx: 0.3
+      dy: 0.3
+      time: ['2018', '2018']
+
+baseload_experiment:
+  enabled: true
+  capacities_gw: [0, 10, 20, 30, 40, 50, 60]
+  summary: results/baseload-weather/summary.csv
+  availability_file: data/nuclear_p_max_pu.csv
+
+solving:
+  mem_mb: 120000
+  runtime: 24h

@@ -1033,6 +1033,11 @@ def extra_functionality(
     else:
         add_co2_atmosphere_constraint(n, snapshots)
 
+    if capacity_gw := getattr(n.params, "baseload_capacity_gw", 0):
+        from baseload_experiment import add_baseload_capacity_constraint
+
+        add_baseload_capacity_constraint(n, capacity_gw)
+
     if config["sector"]["enhanced_geothermal"]["enable"]:
         add_flexible_egs_constraint(n)
 
@@ -1216,6 +1221,18 @@ if __name__ == "__main__":
         limit_max_growth=snakemake.params.get("sector", {}).get("limit_max_growth"),
     )
 
+    if hasattr(snakemake.params, "baseload_capacity_gw"):
+        from baseload_experiment import add_baseload_generators
+
+        add_baseload_generators(
+            n,
+            capacity_gw=snakemake.params.baseload_capacity_gw,
+            cost_file=snakemake.input.baseload_costs,
+            cost_config=snakemake.config["costs"],
+            max_hours=snakemake.config["electricity"]["max_hours"],
+            availability_file=snakemake.input.baseload_availability,
+        )
+
     logging_frequency = snakemake.config.get("solving", {}).get(
         "mem_logging_frequency", 30
     )
@@ -1235,6 +1252,16 @@ if __name__ == "__main__":
 
     n.meta = dict(snakemake.config, **dict(wildcards=dict(snakemake.wildcards)))
     n.export_to_netcdf(snakemake.output.network)
+
+    if getattr(snakemake.output, "metrics", None):
+        from baseload_experiment import write_baseload_metrics
+
+        write_baseload_metrics(
+            n,
+            snakemake.output.metrics,
+            snakemake.params.baseload_capacity_gw,
+            snakemake.wildcards.run,
+        )
 
     with open(snakemake.output.config, "w") as file:
         yaml.dump(

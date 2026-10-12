@@ -38,7 +38,7 @@ benchmarks = path_provider("benchmarks/", RDIR, shared_resources, exclude_from_s
 resources = path_provider("resources/", RDIR, shared_resources, exclude_from_shared)
 
 cutout_dir = config["atlite"]["cutout_directory"]
-CDIR = join(cutout_dir, ("" if run["shared_cutouts"] else RDIR))
+CDIR = join(cutout_dir, ("" if run["shared_cutouts"] else RDIR)).replace("\\", "/")
 RESULTS = "results/" + RDIR
 
 
@@ -68,6 +68,9 @@ include: "rules/development.smk"
 if config["foresight"] == "overnight":
 
     include: "rules/solve_overnight.smk"
+
+    if config.get("baseload_experiment", {}).get("enabled", False):
+        include: "rules/baseload_weather.smk"
 
 
 if config["foresight"] == "myopic":

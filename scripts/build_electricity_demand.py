@@ -254,6 +254,13 @@ if __name__ == "__main__":
 
     load = load_timeseries(snakemake.input.reported, years, countries)
 
+    if fixed_year:
+        if snakemake.params.load["manual_adjustments"]:
+            load = manual_adjustment(load, snakemake.input[0], countries)
+        # Match the reference-year profile to the weather-year snapshots before
+        # reindexing; otherwise every timestamp becomes missing.
+        load.index = load.index.map(lambda t: t.replace(year=snapshots.year[0]))
+
     load = load.reindex(index=snapshots)
 
     if "UA" in countries:
@@ -269,7 +276,7 @@ if __name__ == "__main__":
         if "MD" in countries:
             load["MD"] = 6.2e6 * (load_ua / load_ua.sum())
 
-    if snakemake.params.load["manual_adjustments"]:
+    if snakemake.params.load["manual_adjustments"] and not fixed_year:
         load = manual_adjustment(load, snakemake.input[0], countries)
 
     logger.info(f"Linearly interpolate gaps of size {interpolate_limit} and less.")
@@ -292,9 +299,5 @@ if __name__ == "__main__":
         "`time_shift_for_large_gaps` or modify the `manual_adjustment` function "
         "for implementing the needed load data modifications."
     )
-
-    # need to reindex load time series to target year
-    if fixed_year:
-        load.index = load.index.map(lambda t: t.replace(year=snapshots.year[0]))
 
     load.to_csv(snakemake.output[0])

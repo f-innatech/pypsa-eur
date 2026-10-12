@@ -1,0 +1,53 @@
+# SPDX-FileCopyrightText: Contributors to PyPSA-Eur <https://github.com/pypsa/pypsa-eur>
+# SPDX-License-Identifier: CC0-1.0
+
+weather-2010:
+  snapshots:
+    start: '2010-01-01'
+    end: '2011-01-01'
+  atlite:
+    default_cutout: &cutout2010 europe-2010-sarah3-era5
+  renewable:
+    onwind: {cutout: *cutout2010}
+    offwind-ac: {cutout: *cutout2010}
+    offwind-dc: {cutout: *cutout2010}
+    offwind-float: {cutout: *cutout2010}
+    solar: {cutout: *cutout2010}
+    solar-hsat: {cutout: *cutout2010}
+    hydro: {cutout: *cutout2010}
+  lines:
+    dynamic_line_rating: {cutout: *cutout2010}
+
+weather-2013:
+  snapshots:
+    start: '2013-01-01'
+    end: '2014-01-01'
+  atlite:
+    default_cutout: &cutout2013 europe-2013-sarah3-era5
+  renewable:
+    onwind: {cutout: *cutout2013}
+    offwind-ac: {cutout: *cutout2013}
+    offwind-dc: {cutout: *cutout2013}
+    offwind-float: {cutout: *cutout2013}
+    solar: {cutout: *cutout2013}
+    solar-hsat: {cutout: *cutout2013}
+    hydro: {cutout: *cutout2013}
+  lines:
+    dynamic_line_rating: {cutout: *cutout2013}
+
+weather-2018:
+  snapshots:
+    start: '2018-01-01'
+    end: '2019-01-01'
+  atlite:
+    default_cutout: &cutout2018 europe-2018-sarah3-era5
+  renewable:
+    onwind: {cutout: *cutout2018}
+    offwind-ac: {cutout: *cutout2018}
+    offwind-dc: {cutout: *cutout2018}
+    offwind-float: {cutout: *cutout2018}
+    solar: {cutout: *cutout2018}
+    solar-hsat: {cutout: *cutout2018}
+    hydro: {cutout: *cutout2018}
+  lines:
+    dynamic_line_rating: {cutout: *cutout2018}
