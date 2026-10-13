@@ -23,7 +23,7 @@ rule build_electricity_demand:
     benchmark:
         benchmarks("build_electricity_demand")
     resources:
-        mem_mb=5000,
+        mem_mb=8000,
     conda:
         "../envs/environment.yaml"
     script:
@@ -182,7 +182,7 @@ rule build_ship_raster:
     log:
         logs("build_ship_raster.log"),
     resources:
-        mem_mb=5000,
+        mem_mb=8000,
     benchmark:
         benchmarks("build_ship_raster")
     conda:
