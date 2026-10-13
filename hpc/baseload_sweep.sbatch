@@ -15,7 +15,12 @@ if [[ ! -f Snakefile || ! -f config/config.baseload-weather.yaml ]]; then
     exit 1
 fi
 
-# If Conda is provided by a cluster module, load that module here first.
+# bwUniCluster 3.0 provides Conda through this module.
+if ! command -v conda >/dev/null 2>&1 && command -v module >/dev/null 2>&1; then
+    module load devel/miniforge
+fi
+
+# Also support an existing user Conda installation.
 if ! command -v conda >/dev/null 2>&1; then
     for conda_init in \
         "$HOME/miniconda3/etc/profile.d/conda.sh" \
