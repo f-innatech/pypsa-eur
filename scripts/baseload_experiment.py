@@ -16,7 +16,7 @@ CARRIER = "baseload_candidate"
 def add_baseload_generators(
     n, capacity_gw, cost_file, cost_config, max_hours, availability_file
 ):
-    """Offer zero-CAPEX, nuclear-like capacity at every AC bus.
+    """Offer zero-cost capacity with nuclear-like availability at every AC bus.
 
     Existing nuclear plants remain unchanged. The experiment's exact total
     capacity is imposed in ``add_baseload_capacity_constraint``.
@@ -38,8 +38,6 @@ def add_baseload_generators(
     nyears = n.snapshot_weightings.objective.sum() / 8760
     costs = load_costs(cost_file, copy.deepcopy(cost_config), max_hours, nyears)
     nuclear = costs.loc["nuclear"]
-    fixed_om = nuclear["investment"] * nuclear["FOM"] / 100 * nyears
-
     availability = pd.read_csv(availability_file, index_col="country")["factor"]
     if availability.empty or not availability.between(0, 1, inclusive="right").all():
         raise ValueError("Nuclear availability factors must be in (0, 1]")
@@ -56,18 +54,16 @@ def add_baseload_generators(
         p_nom_extendable=True,
         p_nom_max=capacity_gw * 1e3,
         p_max_pu=bus_availability.to_numpy(),
-        marginal_cost=nuclear["marginal_cost"],
-        capital_cost=fixed_om,
+        marginal_cost=0.0,
+        capital_cost=0.0,
         efficiency=nuclear["efficiency"],
         lifetime=nuclear["lifetime"],
     )
     logger.info(
-        "Offered %.0f GW of baseload across %d AC buses; marginal cost %.2f EUR/MWh; "
-        "fixed O&M %.2f EUR/MW/a",
+        "Offered %.0f GW of zero-CAPEX, zero-OPEX baseload across %d AC buses; "
+        "nuclear-like availability, efficiency and lifetime",
         capacity_gw,
         len(buses),
-        nuclear["marginal_cost"],
-        fixed_om,
     )
 
 

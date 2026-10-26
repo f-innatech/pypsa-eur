@@ -2,7 +2,7 @@
 #SBATCH --job-name=baseload-sweep
 #SBATCH --cpus-per-task=1
 #SBATCH --mem=8G
-#SBATCH --time=7-00:00:00
+#SBATCH --time=3-00:00:00
 #SBATCH --output=baseload-controller-%j.out
 
 # Submit this file from the pypsa-eur repository root.
@@ -40,9 +40,10 @@ fi
 eval "$(conda shell.bash hook)"
 conda activate pypsa-eur
 
-# Use the sibling licence file when present; otherwise keep the cluster's setup.
-if [[ -z "${GRB_LICENSE_FILE:-}" && -f ../gurobi/gurobi.lic ]]; then
-    export GRB_LICENSE_FILE="$PWD/../gurobi/gurobi.lic"
+export GRB_LICENSE_FILE=/home/fr/fr_fr/fr_fp1059/opt/gurobi/gurobi.lic
+if [[ ! -r "$GRB_LICENSE_FILE" ]]; then
+    echo "Gurobi license is not readable: $GRB_LICENSE_FILE" >&2
+    exit 1
 fi
 python -c 'import snakemake_executor_plugin_slurm, gurobipy'
 
@@ -52,13 +53,27 @@ fi
 
 case "${BASELOAD_MODE:-pilot}" in
     pilot)
-        target=results/weather-2013/baseload/metrics/base_s_128___2045_b0.csv
+        targets=(results/weather-2013/baseload-free-opex/metrics/base_s_128___2045_b0.csv)
         ;;
     full)
-        target=baseload_sweep
+        targets=(baseload_sweep)
+        ;;
+    weather-2010)
+        case "${BASELOAD_BATCH:-}" in
+            0|1|2) ;;
+            *)
+                echo "Set BASELOAD_BATCH to 0, 1, or 2 for weather-2010." >&2
+                exit 1
+                ;;
+        esac
+        first_gw=$((BASELOAD_BATCH * 20))
+        targets=(
+            "results/weather-2010/baseload-free-opex/metrics/base_s_128___2045_b${first_gw}.csv"
+            "results/weather-2010/baseload-free-opex/metrics/base_s_128___2045_b$((first_gw + 10)).csv"
+        )
         ;;
     *)
-        echo "BASELOAD_MODE must be pilot or full." >&2
+        echo "BASELOAD_MODE must be pilot, full, or weather-2010." >&2
         exit 1
         ;;
 esac
@@ -72,12 +87,12 @@ if [[ -n "${BASELOAD_ACCOUNT:-}" ]]; then
     default_resources+=("slurm_account=${BASELOAD_ACCOUNT}")
 fi
 
-echo "Mode: ${BASELOAD_MODE:-pilot}; target: $target"
+echo "Mode: ${BASELOAD_MODE:-pilot}; targets: ${targets[*]}"
 echo "Repository: $PWD; environment: $CONDA_DEFAULT_ENV"
 
 snakemake --snakefile Snakefile \
-    --configfile config/config.baseload-weather.yaml \
-    --software-deployment-method conda \
+    --configfile config/config.baseload-weather.yaml config/config.baseload-offline.yaml \
+    --allowed-rules baseload_sweep summarize_baseload_sweep solve_baseload_case \
     --executor slurm \
     --jobs 2 \
     --local-cores 1 \
@@ -89,4 +104,5 @@ snakemake --snakefile Snakefile \
         solve_baseload_case:runtime=2880 \
     --latency-wait 60 \
     --rerun-incomplete \
-    "$target"
+    "${targets[@]}" \
+    --rerun-triggers mtime

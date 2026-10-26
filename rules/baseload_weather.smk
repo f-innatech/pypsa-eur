@@ -3,6 +3,7 @@
 # SPDX-License-Identifier: MIT
 
 capacities_gw = config["baseload_experiment"]["capacities_gw"]
+baseload_output_dir = config["baseload_experiment"].get("output_dir", "baseload")
 if capacities_gw != list(range(0, 61, 10)):
     raise ValueError("The baseload sweep expects 0, 10, ..., 60 GW")
 for key in ("clusters", "opts", "sector_opts", "planning_horizons"):
@@ -11,11 +12,13 @@ for key in ("clusters", "opts", "sector_opts", "planning_horizons"):
 
 BASELOAD_NETWORK = (
     RESULTS
-    + "baseload/networks/base_s_{clusters}_{opts}_{sector_opts}_{planning_horizons}_b{capacity_gw}.nc"
+    + baseload_output_dir
+    + "/networks/base_s_{clusters}_{opts}_{sector_opts}_{planning_horizons}_b{capacity_gw}.nc"
 )
 BASELOAD_METRICS = (
     RESULTS
-    + "baseload/metrics/base_s_{clusters}_{opts}_{sector_opts}_{planning_horizons}_b{capacity_gw}.csv"
+    + baseload_output_dir
+    + "/metrics/base_s_{clusters}_{opts}_{sector_opts}_{planning_horizons}_b{capacity_gw}.csv"
 )
 
 
@@ -75,24 +78,29 @@ rule solve_baseload_case:
     output:
         network=BASELOAD_NETWORK,
         config=RESULTS
-        + "baseload/configs/base_s_{clusters}_{opts}_{sector_opts}_{planning_horizons}_b{capacity_gw}.yaml",
+        + baseload_output_dir
+        + "/configs/base_s_{clusters}_{opts}_{sector_opts}_{planning_horizons}_b{capacity_gw}.yaml",
         metrics=BASELOAD_METRICS,
     shadow:
         shadow_config
     log:
         solver=RESULTS
-        + "baseload/logs/base_s_{clusters}_{opts}_{sector_opts}_{planning_horizons}_b{capacity_gw}_solver.log",
+        + baseload_output_dir
+        + "/logs/base_s_{clusters}_{opts}_{sector_opts}_{planning_horizons}_b{capacity_gw}_solver.log",
         memory=RESULTS
-        + "baseload/logs/base_s_{clusters}_{opts}_{sector_opts}_{planning_horizons}_b{capacity_gw}_memory.log",
+        + baseload_output_dir
+        + "/logs/base_s_{clusters}_{opts}_{sector_opts}_{planning_horizons}_b{capacity_gw}_memory.log",
         python=RESULTS
-        + "baseload/logs/base_s_{clusters}_{opts}_{sector_opts}_{planning_horizons}_b{capacity_gw}_python.log",
+        + baseload_output_dir
+        + "/logs/base_s_{clusters}_{opts}_{sector_opts}_{planning_horizons}_b{capacity_gw}_python.log",
     threads: solver_threads
     resources:
         mem_mb=config_provider("solving", "mem_mb"),
         runtime=config_provider("solving", "runtime", default="6h"),
     benchmark:
         RESULTS
-        + "baseload/benchmarks/base_s_{clusters}_{opts}_{sector_opts}_{planning_horizons}_b{capacity_gw}"
+        + baseload_output_dir
+        + "/benchmarks/base_s_{clusters}_{opts}_{sector_opts}_{planning_horizons}_b{capacity_gw}"
     conda:
         "../envs/environment.yaml"
     script:

@@ -3,7 +3,7 @@
 
 # Overrides config/config.yaml for the 2045 baseload-value experiment.
 run:
-  name: [weather-2010, weather-2013, weather-2018]
+  name: [weather-2010, weather-2013, weather-2019]
   scenarios:
     enable: true
     file: config/scenarios.baseload-weather.yaml
@@ -48,18 +48,19 @@ atlite:
       dx: 0.3
       dy: 0.3
       time: ['2010', '2010']
-    europe-2018-sarah3-era5:
+    europe-2019-sarah3-era5:
       module: [sarah, era5]
       x: [-12., 42.]
       y: [33., 72.]
       dx: 0.3
       dy: 0.3
-      time: ['2018', '2018']
+      time: ['2019', '2019']
 
 baseload_experiment:
   enabled: true
   capacities_gw: [0, 10, 20, 30, 40, 50, 60]
-  summary: results/baseload-weather/summary.csv
+  output_dir: baseload-free-opex
+  summary: results/baseload-weather-free-opex/summary.csv
   availability_file: data/nuclear_p_max_pu.csv
 
 solving:
