@@ -35,19 +35,19 @@ weather-2013:
   lines:
     dynamic_line_rating: {cutout: *cutout2013}
 
-weather-2018:
+weather-2019:
   snapshots:
-    start: '2018-01-01'
-    end: '2019-01-01'
+    start: '2019-01-01'
+    end: '2020-01-01'
   atlite:
-    default_cutout: &cutout2018 europe-2018-sarah3-era5
+    default_cutout: &cutout2019 europe-2019-sarah3-era5
   renewable:
-    onwind: {cutout: *cutout2018}
-    offwind-ac: {cutout: *cutout2018}
-    offwind-dc: {cutout: *cutout2018}
-    offwind-float: {cutout: *cutout2018}
-    solar: {cutout: *cutout2018}
-    solar-hsat: {cutout: *cutout2018}
-    hydro: {cutout: *cutout2018}
+    onwind: {cutout: *cutout2019}
+    offwind-ac: {cutout: *cutout2019}
+    offwind-dc: {cutout: *cutout2019}
+    offwind-float: {cutout: *cutout2019}
+    solar: {cutout: *cutout2019}
+    solar-hsat: {cutout: *cutout2019}
+    hydro: {cutout: *cutout2019}
   lines:
-    dynamic_line_rating: {cutout: *cutout2018}
+    dynamic_line_rating: {cutout: *cutout2019}

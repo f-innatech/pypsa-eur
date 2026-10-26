@@ -1,0 +1,8 @@
+# Add after config.baseload-weather.yaml for the idealised district-heat variant.
+baseload_experiment:
+  output_dir: baseload-chp-free-opex
+  summary: results/baseload-weather-chp-free-opex/summary.csv
+  district_heat:
+    enabled: true
+    electricity_loss_per_mwh_heat: 0.17
+    max_heat_per_mw_e: 0.25

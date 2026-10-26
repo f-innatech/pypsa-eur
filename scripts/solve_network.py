@@ -1034,9 +1034,15 @@ def extra_functionality(
         add_co2_atmosphere_constraint(n, snapshots)
 
     if capacity_gw := getattr(n.params, "baseload_capacity_gw", 0):
-        from baseload_experiment import add_baseload_capacity_constraint
+        from baseload_experiment import (
+            add_baseload_capacity_constraint,
+            add_baseload_heat_constraints,
+        )
 
         add_baseload_capacity_constraint(n, capacity_gw)
+        district_heat = getattr(n.params, "baseload_district_heat", {})
+        if district_heat.get("enabled", False):
+            add_baseload_heat_constraints(n, district_heat)
 
     if config["sector"]["enhanced_geothermal"]["enable"]:
         add_flexible_egs_constraint(n)
@@ -1231,6 +1237,9 @@ if __name__ == "__main__":
             cost_config=snakemake.config["costs"],
             max_hours=snakemake.config["electricity"]["max_hours"],
             availability_file=snakemake.input.baseload_availability,
+            district_heat=snakemake.config["baseload_experiment"].get(
+                "district_heat", {}
+            ),
         )
 
     logging_frequency = snakemake.config.get("solving", {}).get(

@@ -51,9 +51,27 @@ if [[ ! -f data/WDPA.gpkg || ! -f data/WDPA_WDOECM_marine.gpkg ]]; then
     echo "Warning: WDPA inputs are absent; this PyPSA-Eur version may fail to retrieve them." >&2
 fi
 
+config_files=(config/config.baseload-weather.yaml)
+result_subdir=baseload-free-opex
+case "${BASELOAD_VARIANT:-electricity}" in
+    electricity) ;;
+    chp)
+        config_files+=(config/config.baseload-chp.yaml)
+        result_subdir=baseload-chp-free-opex
+        ;;
+    *)
+        echo "BASELOAD_VARIANT must be electricity or chp." >&2
+        exit 1
+        ;;
+esac
+
 case "${BASELOAD_MODE:-pilot}" in
     pilot)
-        targets=(results/weather-2013/baseload-free-opex/metrics/base_s_128___2045_b0.csv)
+        pilot_gw=0
+        if [[ "${BASELOAD_VARIANT:-electricity}" == chp ]]; then
+            pilot_gw=10
+        fi
+        targets=("results/weather-2013/${result_subdir}/metrics/base_s_128___2045_b${pilot_gw}.csv")
         ;;
     full)
         targets=(baseload_sweep)
@@ -68,8 +86,8 @@ case "${BASELOAD_MODE:-pilot}" in
         esac
         first_gw=$((BASELOAD_BATCH * 20))
         targets=(
-            "results/weather-2010/baseload-free-opex/metrics/base_s_128___2045_b${first_gw}.csv"
-            "results/weather-2010/baseload-free-opex/metrics/base_s_128___2045_b$((first_gw + 10)).csv"
+            "results/weather-2010/${result_subdir}/metrics/base_s_128___2045_b${first_gw}.csv"
+            "results/weather-2010/${result_subdir}/metrics/base_s_128___2045_b$((first_gw + 10)).csv"
         )
         ;;
     *)
@@ -87,11 +105,11 @@ if [[ -n "${BASELOAD_ACCOUNT:-}" ]]; then
     default_resources+=("slurm_account=${BASELOAD_ACCOUNT}")
 fi
 
-echo "Mode: ${BASELOAD_MODE:-pilot}; targets: ${targets[*]}"
+echo "Variant: ${BASELOAD_VARIANT:-electricity}; mode: ${BASELOAD_MODE:-pilot}; targets: ${targets[*]}"
 echo "Repository: $PWD; environment: $CONDA_DEFAULT_ENV"
 
 snakemake --snakefile Snakefile \
-    --configfile config/config.baseload-weather.yaml config/config.baseload-offline.yaml \
+    --configfile "${config_files[@]}" config/config.baseload-offline.yaml \
     --allowed-rules baseload_sweep summarize_baseload_sweep solve_baseload_case \
     --executor slurm \
     --jobs 2 \

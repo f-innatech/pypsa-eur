@@ -67,6 +67,7 @@ rule solve_baseload_case:
         ),
         custom_extra_functionality=input_custom_extra_functionality,
         baseload_capacity_gw=lambda w: int(w.capacity_gw),
+        baseload_district_heat=config["baseload_experiment"].get("district_heat", {}),
     input:
         network=resources(
             "networks/base_s_{clusters}_{opts}_{sector_opts}_{planning_horizons}.nc"
