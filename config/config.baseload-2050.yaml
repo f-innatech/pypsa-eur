@@ -1,0 +1,13 @@
+# Use after config.baseload-weather.yaml for the 2050 climate-neutral sweep.
+scenario:
+  planning_horizons: [2050]
+
+costs:
+  year: 2050
+
+co2_budget:
+  2050: 0.0
+
+enable:
+  build_cutout: false
+  retrieve_cutout: false

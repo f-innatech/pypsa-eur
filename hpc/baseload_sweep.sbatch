@@ -52,6 +52,15 @@ if [[ ! -f data/WDPA.gpkg || ! -f data/WDPA_WDOECM_marine.gpkg ]]; then
 fi
 
 config_files=(config/config.baseload-weather.yaml)
+planning_year="${BASELOAD_YEAR:-2045}"
+case "$planning_year" in
+    2045) ;;
+    2050) config_files+=(config/config.baseload-2050.yaml) ;;
+    *)
+        echo "BASELOAD_YEAR must be 2045 or 2050." >&2
+        exit 1
+        ;;
+esac
 result_subdir=baseload-free-opex
 case "${BASELOAD_VARIANT:-chp}" in
     electricity) ;;
@@ -71,7 +80,7 @@ case "${BASELOAD_MODE:-pilot}" in
         if [[ "${BASELOAD_VARIANT:-chp}" == chp ]]; then
             pilot_gw=60
         fi
-        targets=("results/weather-2010/${result_subdir}/metrics/base_s_128___2045_b${pilot_gw}.csv")
+        targets=("results/weather-2010/${result_subdir}/metrics/base_s_128___${planning_year}_b${pilot_gw}.csv")
         ;;
     full)
         targets=(baseload_sweep)
@@ -86,8 +95,8 @@ case "${BASELOAD_MODE:-pilot}" in
         esac
         first_gw=$((BASELOAD_BATCH * 120))
         targets=(
-            "results/weather-2010/${result_subdir}/metrics/base_s_128___2045_b${first_gw}.csv"
-            "results/weather-2010/${result_subdir}/metrics/base_s_128___2045_b$((first_gw + 60)).csv"
+            "results/weather-2010/${result_subdir}/metrics/base_s_128___${planning_year}_b${first_gw}.csv"
+            "results/weather-2010/${result_subdir}/metrics/base_s_128___${planning_year}_b$((first_gw + 60)).csv"
         )
         ;;
     *)
@@ -105,7 +114,7 @@ if [[ -n "${BASELOAD_ACCOUNT:-}" ]]; then
     default_resources+=("slurm_account=${BASELOAD_ACCOUNT}")
 fi
 
-echo "Variant: ${BASELOAD_VARIANT:-chp}; mode: ${BASELOAD_MODE:-pilot}; targets: ${targets[*]}"
+echo "Year: ${planning_year}; variant: ${BASELOAD_VARIANT:-chp}; mode: ${BASELOAD_MODE:-pilot}; targets: ${targets[*]}"
 echo "Repository: $PWD; environment: $CONDA_DEFAULT_ENV"
 
 snakemake --snakefile Snakefile \
@@ -127,5 +136,5 @@ snakemake --snakefile Snakefile \
 
 if [[ "${BASELOAD_MODE:-pilot}" == pilot && "${BASELOAD_VARIANT:-chp}" == chp ]]; then
     python scripts/check_baseload_chp.py \
-        "results/weather-2010/${result_subdir}/networks/base_s_128___2045_b60.nc"
+        "results/weather-2010/${result_subdir}/networks/base_s_128___${planning_year}_b60.nc"
 fi
