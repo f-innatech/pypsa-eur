@@ -51,6 +51,14 @@ INDUSTRY_ENERGY_LOAD_CARRIERS = {
     "coal for industry", "solid biomass for industry",
     "low-temperature heat for industry",
 }
+OBJECTIVE_COMPONENTS = (
+    ("Generator", "generators", "p_nom", "p"),
+    ("Link", "links", "p_nom", "p0"),
+    ("Store", "stores", "e_nom", "p"),
+    ("StorageUnit", "storage_units", "p_nom", "p_dispatch"),
+    ("Line", "lines", "s_nom", None),
+    ("Transformer", "transformers", "s_nom", None),
+)
 
 
 def find_networks(inputs):
@@ -64,7 +72,7 @@ def find_networks(inputs):
             raise FileNotFoundError(item)
     files = sorted({path.resolve() for path in files if CAPACITY_IN_FILENAME.search(path.name)})
     if not files:
-        raise ValueError("No solved baseload networks (*_b0.nc, *_b10.nc, ...) found")
+        raise ValueError("No solved baseload networks (*_b0.nc, *_b60.nc, ...) found")
     return files
 
 
@@ -273,6 +281,63 @@ def sector_final_energy_demand(network, weather_year, baseload_gw):
     return rows
 
 
+def sector_load_profile(network):
+    """Europe-wide sector load at each snapshot, using the annual chart's basis."""
+    snapshots = network.snapshots
+
+    def total(dispatch, names):
+        if len(names) == 0:
+            return pd.Series(0.0, index=snapshots)
+        if not names.isin(dispatch.columns).all():
+            raise ValueError("Missing sector load time series")
+        return dispatch[names].sum(axis=1).reindex(snapshots)
+
+    loads = network.loads
+    links = active_assets(network.links)
+    transport_fuels = loads.index[loads.carrier.isin(TRANSPORT_FUEL_LOAD_CARRIERS)]
+    industry = loads.index[loads.carrier.isin(INDUSTRY_ENERGY_LOAD_CARRIERS)]
+    other_electricity = loads.index[loads.carrier == "electricity"]
+    bev = links.index[links.carrier == "BEV charger"]
+    v2g = links.index[links.carrier == "V2G"]
+
+    district = loads.index[loads.carrier == "urban central heat"]
+    district_loss = network.meta.get("sector", {}).get("district_heating", {}).get(
+        "district_heating_loss", 0
+    )
+    decentral_buses = set(network.buses.index[
+        network.buses.carrier.isin(["rural heat", "urban decentral heat"])
+    ])
+    heating_links = links.carrier.str.contains(
+        "heat pump|gas boiler|biomass boiler|resistive heater", regex=True
+    )
+    heat_output = pd.Series(False, index=links.index)
+    for port in range(1, 5):
+        bus = f"bus{port}"
+        if bus in links:
+            heat_output |= links[bus].isin(decentral_buses)
+    heating_names = links.index[heating_links & heat_output]
+    solar = active_assets(network.generators)
+    solar = solar.loc[
+        solar.bus.isin(decentral_buses) & solar.carrier.str.contains("solar thermal")
+    ]
+
+    profile = pd.DataFrame(index=snapshots)
+    profile["Transport"] = (
+        total(network.loads_t.p, transport_fuels)
+        + total(network.links_t.p0, bev)
+        + total(network.links_t.p1, v2g)
+    )
+    profile["Industry"] = total(network.loads_t.p, industry)
+    profile["Heating"] = (
+        total(network.loads_t.p, district) / (1 + district_loss)
+        + total(network.links_t.p0, heating_names)
+        + total(network.generators_t.p, solar.index)
+    )
+    profile["Other electricity"] = total(network.loads_t.p, other_electricity)
+    profile.index.name = "Time"
+    return profile / 1e3  # MW to GW
+
+
 def baseload_siting(network, weather_year, baseload_gw):
     """Installed experimental baseload and annual output at each AC bus."""
     buses = network.buses.loc[network.buses.carrier == "AC"]
@@ -353,19 +418,22 @@ def installed_capacities(network, weather_year, baseload_gw):
     return rows
 
 
-def annual_variable_cost(network, component, names, dispatch_attribute):
-    """Own marginal cost only; upstream fuel and electricity costs are separate."""
+def annual_variable_cost(network, component, names, dispatch_attribute,
+                         cost_attribute="marginal_cost"):
+    """Weighted cost of one dispatch variable; upstream costs are separate."""
     if len(names) == 0:
         return pd.Series(dtype=float)
     table = getattr(network, component)
     pnl = getattr(network, f"{component}_t")
+    if cost_attribute not in table:
+        return pd.Series(0.0, index=names)
     dispatch = getattr(pnl, dispatch_attribute).reindex(
         index=network.snapshots, columns=names, fill_value=0
     )
     weighted = dispatch.mul(snapshot_weights(network, "objective"), axis=0)
-    static = pd.to_numeric(table.loc[names, "marginal_cost"], errors="coerce").fillna(0)
+    static = pd.to_numeric(table.loc[names, cost_attribute], errors="coerce").fillna(0)
     result = weighted.sum() * static
-    dynamic = getattr(pnl, "marginal_cost", pd.DataFrame())
+    dynamic = getattr(pnl, cost_attribute, pd.DataFrame())
     varying = names.intersection(dynamic.columns)
     if len(varying):
         rates = dynamic[varying].reindex(network.snapshots)
@@ -374,12 +442,165 @@ def annual_variable_cost(network, component, names, dispatch_attribute):
     return result
 
 
+def system_cost_category(network, component, table):
+    """Assign each asset's full objective contribution to one functional group."""
+    if component in {"Line", "Transformer"}:
+        return pd.Series("Infrastructure", index=table.index)
+    if component == "StorageUnit":
+        return pd.Series("Storage", index=table.index)
+    carrier = table.carrier.fillna("")
+    if component == "Store":
+        return pd.Series(
+            np.where(carrier.str.contains("co2", case=False), "Carbon management", "Storage"),
+            index=table.index,
+        )
+    if component == "Generator":
+        bus_carrier = table.bus.map(network.buses.carrier).fillna("")
+        return pd.Series(
+            np.select(
+                [bus_carrier.isin(["AC", "low voltage"]),
+                 bus_carrier.str.contains("heat", case=False)],
+                ["Electricity generation", "Heat supply"],
+                default="Fuel and resources",
+            ),
+            index=table.index,
+        )
+
+    # Multi-output links are counted once. CHP is assigned to electricity
+    # generation; its heat output does not create a second cost entry.
+    group = pd.Series("Conversion and industry", index=table.index)
+    electric_output = pd.Series(False, index=table.index)
+    heat_output = pd.Series(False, index=table.index)
+    for port in range(1, 5):
+        bus = f"bus{port}"
+        if bus not in table:
+            continue
+        efficiency = "efficiency" if port == 1 else f"efficiency{port}"
+        if efficiency not in table:
+            continue
+        producing = pd.to_numeric(table[efficiency], errors="coerce").fillna(0) > 0
+        output_carrier = table[bus].map(network.buses.carrier).fillna("")
+        electric_output |= producing & output_carrier.isin(["AC", "low voltage"])
+        heat_output |= producing & output_carrier.str.contains("heat", case=False)
+    group.loc[heat_output] = "Heat supply"
+    group.loc[electric_output] = "Electricity generation"
+    group.loc[carrier.str.contains(
+        r"electrolysis|Fischer-Tropsch|methanolisation|methanation|SMR|for industry",
+        case=False, regex=True,
+    )] = "Conversion and industry"
+    group.loc[carrier.str.contains(
+        r"^DAC$|process emissions|co2|carbon capture|cement capture",
+        case=False, regex=True,
+    )] = "Carbon management"
+    group.loc[carrier.str.contains(
+        r"battery|water tanks|V2G|BEV charger|storage charger|storage discharger",
+        case=False, regex=True,
+    )] = "Storage"
+    group.loc[carrier.str.contains(
+        r"^DC$|pipeline|distribution grid|grid connection|transmission",
+        case=False, regex=True,
+    )] = "Infrastructure"
+    return group
+
+
+def system_cost_breakdown(network, weather_year, baseload_gw):
+    """Reconstruct PyPSA's objective by component and carrier, in EUR/year."""
+    rows = []
+    for component, attribute, nominal, dispatch_attribute in OBJECTIVE_COMPONENTS:
+        table = active_assets(getattr(network, attribute))
+        if table.empty:
+            continue
+        fixed = pd.Series(0.0, index=table.index)
+        extendable = table[f"{nominal}_extendable"].fillna(False).astype(bool)
+        if extendable.any():
+            capacity = nominal_capacity(table, nominal, f"{nominal}_opt")
+            fixed.loc[extendable] = (
+                (capacity.loc[extendable] - table.loc[extendable, nominal])
+                * table.loc[extendable, "capital_cost"]
+            )
+
+        variable = pd.Series(0.0, index=table.index)
+        if dispatch_attribute is not None:
+            # Keep peak memory bounded when a network has thousands of links.
+            for start in range(0, len(table), 256):
+                names = table.index[start:start + 256]
+                variable.loc[names] += annual_variable_cost(
+                    network, attribute, names, dispatch_attribute
+                )
+                if component in {"Store", "StorageUnit"}:
+                    extra = (
+                        (("marginal_cost_storage", "e"),) if component == "Store"
+                        else (("marginal_cost_storage", "state_of_charge"),
+                              ("spill_cost", "spill"))
+                    )
+                    for cost_attribute, operation in extra:
+                        if (cost_attribute not in table
+                                or not table.loc[names, cost_attribute].fillna(0).ne(0).any()):
+                            continue
+                        variable.loc[names] += annual_variable_cost(
+                            network, attribute, names, operation, cost_attribute
+                        )
+                if component in {"Generator", "Link"}:
+                    if ("stand_by_cost" in table
+                            and table.loc[names, "stand_by_cost"].fillna(0).ne(0).any()):
+                        variable.loc[names] += annual_variable_cost(
+                            network, attribute, names, "status", "stand_by_cost"
+                        )
+                    for operation in ("start_up", "shut_down"):
+                        cost_attribute = f"{operation}_cost"
+                        if (cost_attribute not in table
+                                or not table.loc[names, cost_attribute].fillna(0).ne(0).any()):
+                            continue
+                        events = getattr(getattr(network, f"{attribute}_t"), operation)
+                        variable.loc[names] += events.reindex(
+                            index=network.snapshots, columns=names, fill_value=0
+                        ).sum().mul(table.loc[names, cost_attribute])
+
+        if ("marginal_cost_quadratic" in table
+                and table.marginal_cost_quadratic.fillna(0).ne(0).any()):
+            raise ValueError("Quadratic marginal costs need separate objective accounting")
+        costs = pd.DataFrame({
+            "category": system_cost_category(network, component, table),
+            "carrier": table.carrier.replace("", pd.NA).fillna("unspecified"),
+            "investment_cost_eur_per_year": fixed,
+            "operating_cost_eur_per_year": variable,
+        })
+        costs = costs.loc[
+            (costs.investment_cost_eur_per_year.abs() > 1e-4)
+            | (costs.operating_cost_eur_per_year.abs() > 1e-4)
+        ]
+        if costs.empty:
+            continue
+        costs["component"] = component
+        rows.append(costs.groupby(["category", "component", "carrier"], as_index=False)
+                    [["investment_cost_eur_per_year", "operating_cost_eur_per_year"]].sum())
+
+    breakdown = pd.concat(rows, ignore_index=True)
+    breakdown["total_cost_eur_per_year"] = (
+        breakdown.investment_cost_eur_per_year + breakdown.operating_cost_eur_per_year
+    )
+    objective = float(network.objective)
+    residual = objective - breakdown.total_cost_eur_per_year.sum()
+    if abs(residual) > max(1.0, abs(objective) * 1e-9):
+        print(f"Warning: {weather_year} b{baseload_gw:g} objective residual "
+              f"{residual / 1e9:+.4f} billion EUR/year")
+        breakdown.loc[len(breakdown)] = dict(
+            category="Other objective terms", component="Other", carrier="unallocated",
+            investment_cost_eur_per_year=0.0,
+            operating_cost_eur_per_year=residual,
+            total_cost_eur_per_year=residual,
+        )
+    breakdown.insert(0, "baseload_gw", baseload_gw)
+    breakdown.insert(0, "weather_year", weather_year)
+    return breakdown
+
+
 def district_heat_role(carrier):
     if "water tanks charger" in carrier:
         return "storage_charge", "district_heat_only"
     if "water tanks discharger" in carrier:
         return "storage_discharge", "district_heat_only"
-    if "CHP" in carrier:
+    if "CHP" in carrier or carrier == "baseload_candidate_heat":
         return "chp_heat", "shared_chp"
     if "heat vent" in carrier:
         return "heat_vent", "district_heat_only"
@@ -598,10 +819,12 @@ def district_heating(network, weather_year, baseload_gw):
 
 def compare(network_files):
     costs = []
+    cost_details = []
     capacities = []
     electric_generation = []
     electricity_energy = []
     final_energy_demand = []
+    sector_profiles = {}
     baseload_nodes = []
     heat_assets = []
     heat_loads = []
@@ -626,6 +849,7 @@ def compare(network_files):
                 "network_file": str(path),
             }
         )
+        cost_details.append(system_cost_breakdown(network, weather_year, baseload_gw))
         capacities.extend(installed_capacities(network, weather_year, baseload_gw))
         electric_generation.extend(
             electric_generation_capacities(network, weather_year, baseload_gw)
@@ -636,6 +860,10 @@ def compare(network_files):
         final_energy_demand.extend(
             sector_final_energy_demand(network, weather_year, baseload_gw)
         )
+        if weather_year not in sector_profiles or baseload_gw == 0:
+            sector_profiles[weather_year] = (
+                baseload_gw, sector_load_profile(network)
+            )
         baseload_nodes.append(baseload_siting(network, weather_year, baseload_gw))
         assets, loads, summary = district_heating(network, weather_year, baseload_gw)
         heat_assets.extend(assets)
@@ -653,6 +881,9 @@ def compare(network_files):
     )
     costs["saving_vs_baseline_eur_per_year"] = (
         costs.baseline_cost_eur_per_year - costs.system_cost_eur_per_year
+    )
+    cost_detail_table = pd.concat(cost_details, ignore_index=True).sort_values(
+        ["weather_year", "baseload_gw", "category", "component", "carrier"]
     )
 
     capacity_tables = []
@@ -709,6 +940,12 @@ def compare(network_files):
     demand_table = pd.DataFrame(final_energy_demand).sort_values(
         ["weather_year", "baseload_gw", "sector", "carrier"]
     )
+    profile_table = pd.concat(
+        [
+            profile.assign(weather_year=year, baseload_gw=capacity)
+            for year, (capacity, profile) in sorted(sector_profiles.items())
+        ]
+    ).reset_index().sort_values(["weather_year", "Time"])
 
     node_table = pd.concat(baseload_nodes, ignore_index=True).sort_values(
         ["weather_year", "baseload_gw", "country", "node"]
@@ -745,19 +982,21 @@ def compare(network_files):
             + summary_table.dedicated_heat_asset_variable_cost_bn_eur
         )
         summary_table = summary_table.sort_values(["weather_year", "baseload_gw"])
-    return (costs, capacity_table, generation_table, energy_table, demand_table,
+    return (costs, cost_detail_table, capacity_table, generation_table,
+            energy_table, demand_table,
+            profile_table,
             node_table, country_table,
             asset_table, load_table, summary_table)
 
 
-def plot_costs(costs, output_file):
+def plot_costs(costs, output_file, case_steps):
     matplotlib.use("Agg")
     import matplotlib.pyplot as plt
 
     fig, axes = plt.subplots(1, 2, figsize=(12, 4.5), sharex=True)
     for year, group in costs.groupby("weather_year"):
-        # Leave visible gaps where a 10 GW case has not been downloaded.
-        group = group.set_index("baseload_gw").reindex(range(0, 61, 10))
+        # Leave visible gaps where an expected case has not been downloaded.
+        group = group.set_index("baseload_gw").reindex(case_steps)
         axes[0].plot(
             group.index,
             group.system_cost_eur_per_year / 1e9,
@@ -781,11 +1020,111 @@ def plot_costs(costs, output_file):
     plt.close(fig)
 
 
-def plot_capacity_changes(capacities, output_dir, top_carriers=12):
+def plot_system_cost_breakdown(cost_details, costs, output_dir):
+    """Show cost groups plus generation, storage, and grid technologies."""
     matplotlib.use("Agg")
     import matplotlib.pyplot as plt
 
-    case_steps = list(range(0, 61, 10))
+    colors = {
+        "Electricity generation": "#4477aa",
+        "Heat supply": "#ee9944",
+        "Fuel and resources": "#aa5533",
+        "Conversion and industry": "#aa77bb",
+        "Storage": "#66aa55",
+        "Infrastructure": "#888888",
+        "Carbon management": "#44aaaa",
+        "Other objective terms": "#222222",
+    }
+
+    def stack(ax, values, palette):
+        x = np.arange(len(values))
+        positive = np.zeros(len(values))
+        negative = np.zeros(len(values))
+        for i, label in enumerate(values.columns):
+            height = values[label].to_numpy(dtype=float)
+            bottom = np.where(height >= 0, positive, negative)
+            ax.bar(x, height, bottom=bottom, width=0.75,
+                   label=label, color=palette(label, i))
+            positive += np.maximum(height, 0)
+            negative += np.minimum(height, 0)
+        ax.grid(axis="y", alpha=0.2)
+        ax.set_axisbelow(True)
+
+    for year, group in cost_details.groupby("weather_year"):
+        cases = sorted(group.baseload_gw.unique())
+        categories = group.pivot_table(
+            index="baseload_gw", columns="category", values="total_cost_eur_per_year",
+            aggfunc="sum", fill_value=0,
+        ).reindex(index=cases, fill_value=0) / 1e9
+        order = [name for name in colors if name in categories]
+        categories = categories[order]
+
+        generation = group.loc[group.category == "Electricity generation"]
+        technologies = generation.pivot_table(
+            index="baseload_gw", columns="carrier", values="total_cost_eur_per_year",
+            aggfunc="sum", fill_value=0,
+        ).reindex(index=cases, fill_value=0) / 1e9
+        ranking = technologies.abs().max().sort_values(ascending=False)
+        selected = ranking[ranking > 0.05].head(15).index
+        other = technologies.drop(columns=selected).sum(axis=1)
+        technologies = technologies[selected].copy()
+        if other.abs().max() > 0.001:
+            technologies["Other electricity generation"] = other
+
+        facilities = group.loc[
+            group.category.isin(["Storage", "Infrastructure"])
+        ].copy()
+        facilities["technology"] = facilities.category + ": " + facilities.carrier
+        facility_values = facilities.pivot_table(
+            index="baseload_gw", columns="technology", values="total_cost_eur_per_year",
+            aggfunc="sum", fill_value=0,
+        ).reindex(index=cases, fill_value=0) / 1e9
+        facility_ranking = facility_values.abs().max().sort_values(ascending=False)
+        facility_selected = facility_ranking[facility_ranking > 0.05].head(15).index
+        facility_other = facility_values.drop(columns=facility_selected).sum(axis=1)
+        facility_values = facility_values[facility_selected].copy()
+        if facility_other.abs().max() > 0.001:
+            facility_values["Other storage and infrastructure"] = facility_other
+
+        fig, axes = plt.subplots(3, 1, figsize=(13, 12), sharex=True)
+        stack(axes[0], categories, lambda name, _: colors[name])
+        year_costs = costs.loc[costs.weather_year == year].set_index("baseload_gw")
+        axes[0].plot(np.arange(len(cases)),
+                     year_costs.loc[cases, "system_cost_eur_per_year"] / 1e9,
+                     "ko", markersize=3, label="Reported objective")
+        axes[0].set(title=f"{year}: annual system cost by function",
+                    ylabel="Billion EUR/year")
+        axes[0].legend(loc="upper left", bbox_to_anchor=(1.01, 1), fontsize=8)
+
+        if not technologies.empty:
+            palette = plt.get_cmap("tab20")
+            stack(axes[1], technologies,
+                  lambda _, i: palette(i % palette.N))
+            axes[1].legend(loc="upper left", bbox_to_anchor=(1.01, 1), fontsize=8)
+        axes[1].set(title="Electricity-generation cost by technology",
+                    ylabel="Billion EUR/year")
+        if not facility_values.empty:
+            palette = plt.get_cmap("tab20")
+            stack(axes[2], facility_values,
+                  lambda _, i: palette(i % palette.N))
+            axes[2].legend(loc="upper left", bbox_to_anchor=(1.01, 1), fontsize=8)
+        axes[2].set(title="Storage and infrastructure cost by technology",
+                    ylabel="Billion EUR/year",
+                    xlabel="Added baseload capacity (GW)")
+        axes[2].set_xticks(np.arange(len(cases)), [f"{case:g}" for case in cases])
+        fig.text(0.02, 0.01,
+                 "Objective costs: new investment and operation; existing fixed assets' "
+                 "capital costs are excluded. Full carrier detail is in system_cost_breakdown.csv.",
+                 fontsize=8)
+        fig.tight_layout(rect=(0, 0.035, 0.78, 1))
+        fig.savefig(output_dir / f"system_cost_breakdown_{year}.png", dpi=160)
+        plt.close(fig)
+
+
+def plot_capacity_changes(capacities, output_dir, case_steps, top_carriers=12):
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+
     for (year, component, unit, basis), group in capacities.groupby(
         ["weather_year", "component", "unit", "capacity_basis"]
     ):
@@ -966,6 +1305,34 @@ def plot_sector_final_energy_demand(demand, energy, output_dir):
         plt.close(fig)
 
 
+def plot_sector_load_profiles(profiles, output_dir):
+    import matplotlib.pyplot as plt
+
+    colors = {
+        "Transport": "#4477aa",
+        "Heating": "#66aa55",
+        "Industry": "#cc8844",
+        "Other electricity": "#7a5195",
+    }
+    for year, group in profiles.groupby("weather_year"):
+        fig, ax = plt.subplots(figsize=(16, 5.5))
+        for sector, color in colors.items():
+            ax.plot(group.Time, group[sector], color=color, linewidth=0.75,
+                    label=sector)
+        capacity = group.baseload_gw.iloc[0]
+        ax.set(
+            title=f"{year}: Europe-wide load by sector ({capacity:g} GW baseload case)",
+            xlabel="Time",
+            ylabel="Load (GW)",
+        )
+        ax.grid(alpha=0.25)
+        ax.legend(ncol=4, loc="upper center", bbox_to_anchor=(0.5, 1.0))
+        fig.autofmt_xdate()
+        fig.tight_layout()
+        fig.savefig(output_dir / f"sector_load_profile_{year}.png", dpi=160)
+        plt.close(fig)
+
+
 def plot_baseload_siting(nodes, countries, output_dir):
     import matplotlib.pyplot as plt
 
@@ -1076,20 +1443,34 @@ def main():
         default=Path("results/baseload_comparison"),
         help="Directory for comparison CSVs and cost plot",
     )
+    parser.add_argument(
+        "--expected-capacities",
+        nargs="+",
+        type=float,
+        help="Expected GW cases; show gaps for missing networks (default: loaded cases)",
+    )
     args = parser.parse_args()
 
-    (costs, capacities, generation, energy, demand, baseload_nodes, baseload_countries,
+    (costs, cost_details, capacities, generation, energy, demand, profiles,
+     baseload_nodes, baseload_countries,
      heat_assets, heat_loads, heat_summary) = compare(find_networks(args.inputs))
+    case_steps = (
+        sorted(set(args.expected_capacities))
+        if args.expected_capacities is not None
+        else sorted(costs.baseload_gw.unique())
+    )
     for year, group in costs.groupby("weather_year"):
-        missing = sorted(set(range(0, 61, 10)) - set(group.baseload_gw))
+        missing = sorted(set(case_steps) - set(group.baseload_gw))
         if missing:
             print(f"Weather {year}: missing baseload cases {missing} GW")
     args.output_dir.mkdir(parents=True, exist_ok=True)
     costs.to_csv(args.output_dir / "system_costs.csv", index=False)
+    cost_details.to_csv(args.output_dir / "system_cost_breakdown.csv", index=False)
     capacities.to_csv(args.output_dir / "installed_capacities.csv", index=False)
     generation.to_csv(args.output_dir / "generation_capacities.csv", index=False)
     energy.to_csv(args.output_dir / "electricity_generation_twh.csv", index=False)
     demand.to_csv(args.output_dir / "sector_final_energy_demand_twh.csv", index=False)
+    profiles.to_csv(args.output_dir / "sector_load_profile_gw.csv", index=False)
     (args.output_dir / "sector_final_energy_demand_notes.txt").write_text(
         "Annual demand uses snapshot-weighted solved dispatch in TWh.\n"
         "Transport includes land-transport oil, aviation kerosene, shipping oil "
@@ -1103,7 +1484,11 @@ def main():
         "industrial hydrogen may still include feedstock use.\n"
         "Baseload output is electricity and cannot replace all sector carriers "
         "one-for-one. These are approximate final-energy quantities, not a "
-        "formal statistical energy balance.\n",
+        "formal statistical energy balance.\n"
+        "The 3-hour load profile sums these sectors across all model buses "
+        "for the 0 GW case (or the lowest available case). Its additional "
+        "Other electricity line contains direct Loads with carrier electricity; "
+        "all lines are snapshot power in GW.\n",
         encoding="utf-8",
     )
     baseload_nodes.to_csv(args.output_dir / "baseload_siting_nodes.csv", index=False)
@@ -1111,11 +1496,13 @@ def main():
     heat_assets.to_csv(args.output_dir / "district_heating_technologies.csv", index=False)
     heat_loads.to_csv(args.output_dir / "district_heating_loads.csv", index=False)
     heat_summary.to_csv(args.output_dir / "district_heating_summary.csv", index=False)
-    plot_costs(costs, args.output_dir / "system_costs.png")
-    plot_capacity_changes(capacities, args.output_dir)
+    plot_costs(costs, args.output_dir / "system_costs.png", case_steps)
+    plot_system_cost_breakdown(cost_details, costs, args.output_dir)
+    plot_capacity_changes(capacities, args.output_dir, case_steps)
     plot_electric_generation(generation, args.output_dir)
     plot_electricity_generated(energy, args.output_dir)
     plot_sector_final_energy_demand(demand, energy, args.output_dir)
+    plot_sector_load_profiles(profiles, args.output_dir)
     plot_baseload_siting(baseload_nodes, baseload_countries, args.output_dir)
     plot_district_heating(heat_assets, heat_summary, args.output_dir)
     (args.output_dir / "district_heating_notes.txt").write_text(

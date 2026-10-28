@@ -2,7 +2,7 @@
 #SBATCH --job-name=baseload-sweep
 #SBATCH --cpus-per-task=1
 #SBATCH --mem=8G
-#SBATCH --time=3-00:00:00
+#SBATCH --time=24:00:00
 #SBATCH --output=baseload-controller-%j.out
 
 # Submit this file from the pypsa-eur repository root.
@@ -53,7 +53,7 @@ fi
 
 config_files=(config/config.baseload-weather.yaml)
 result_subdir=baseload-free-opex
-case "${BASELOAD_VARIANT:-electricity}" in
+case "${BASELOAD_VARIANT:-chp}" in
     electricity) ;;
     chp)
         config_files+=(config/config.baseload-chp.yaml)
@@ -68,10 +68,10 @@ esac
 case "${BASELOAD_MODE:-pilot}" in
     pilot)
         pilot_gw=0
-        if [[ "${BASELOAD_VARIANT:-electricity}" == chp ]]; then
-            pilot_gw=10
+        if [[ "${BASELOAD_VARIANT:-chp}" == chp ]]; then
+            pilot_gw=60
         fi
-        targets=("results/weather-2013/${result_subdir}/metrics/base_s_128___2045_b${pilot_gw}.csv")
+        targets=("results/weather-2010/${result_subdir}/metrics/base_s_128___2045_b${pilot_gw}.csv")
         ;;
     full)
         targets=(baseload_sweep)
@@ -84,10 +84,10 @@ case "${BASELOAD_MODE:-pilot}" in
                 exit 1
                 ;;
         esac
-        first_gw=$((BASELOAD_BATCH * 20))
+        first_gw=$((BASELOAD_BATCH * 120))
         targets=(
             "results/weather-2010/${result_subdir}/metrics/base_s_128___2045_b${first_gw}.csv"
-            "results/weather-2010/${result_subdir}/metrics/base_s_128___2045_b$((first_gw + 10)).csv"
+            "results/weather-2010/${result_subdir}/metrics/base_s_128___2045_b$((first_gw + 60)).csv"
         )
         ;;
     *)
@@ -105,7 +105,7 @@ if [[ -n "${BASELOAD_ACCOUNT:-}" ]]; then
     default_resources+=("slurm_account=${BASELOAD_ACCOUNT}")
 fi
 
-echo "Variant: ${BASELOAD_VARIANT:-electricity}; mode: ${BASELOAD_MODE:-pilot}; targets: ${targets[*]}"
+echo "Variant: ${BASELOAD_VARIANT:-chp}; mode: ${BASELOAD_MODE:-pilot}; targets: ${targets[*]}"
 echo "Repository: $PWD; environment: $CONDA_DEFAULT_ENV"
 
 snakemake --snakefile Snakefile \
@@ -124,3 +124,8 @@ snakemake --snakefile Snakefile \
     --rerun-incomplete \
     "${targets[@]}" \
     --rerun-triggers mtime
+
+if [[ "${BASELOAD_MODE:-pilot}" == pilot && "${BASELOAD_VARIANT:-chp}" == chp ]]; then
+    python scripts/check_baseload_chp.py \
+        "results/weather-2010/${result_subdir}/networks/base_s_128___2045_b60.nc"
+fi

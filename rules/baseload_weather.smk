@@ -4,8 +4,14 @@
 
 capacities_gw = config["baseload_experiment"]["capacities_gw"]
 baseload_output_dir = config["baseload_experiment"].get("output_dir", "baseload")
-if capacities_gw != list(range(0, 61, 10)):
-    raise ValueError("The baseload sweep expects 0, 10, ..., 60 GW")
+if (
+    not capacities_gw
+    or capacities_gw[0] != 0
+    or any(type(capacity) is not int or capacity < 0 for capacity in capacities_gw)
+    or capacities_gw != sorted(set(capacities_gw))
+):
+    raise ValueError("Baseload capacities must be sorted, unique, non-negative integers starting at 0")
+capacity_wildcard = "|".join(str(capacity) for capacity in sorted(capacities_gw, reverse=True))
 for key in ("clusters", "opts", "sector_opts", "planning_horizons"):
     if len(config["scenario"][key]) != 1:
         raise ValueError(f"The baseload sweep requires one scenario.{key} value")
@@ -58,7 +64,7 @@ rule summarize_baseload_sweep:
 
 rule solve_baseload_case:
     wildcard_constraints:
-        capacity_gw="0|10|20|30|40|50|60",
+        capacity_gw=capacity_wildcard,
     params:
         solving=config_provider("solving"),
         foresight=config_provider("foresight"),
