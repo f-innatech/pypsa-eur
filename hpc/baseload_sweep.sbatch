@@ -85,22 +85,23 @@ case "${BASELOAD_MODE:-pilot}" in
     full)
         targets=(baseload_sweep)
         ;;
-    weather-2010)
+    weather-2010|weather-2013)
+        weather_run="${BASELOAD_MODE}"
         case "${BASELOAD_BATCH:-}" in
             0|1|2) ;;
             *)
-                echo "Set BASELOAD_BATCH to 0, 1, or 2 for weather-2010." >&2
+                echo "Set BASELOAD_BATCH to 0, 1, or 2 for ${weather_run}." >&2
                 exit 1
                 ;;
         esac
         first_gw=$((BASELOAD_BATCH * 120))
         targets=(
-            "results/weather-2010/${result_subdir}/metrics/base_s_128___${planning_year}_b${first_gw}.csv"
-            "results/weather-2010/${result_subdir}/metrics/base_s_128___${planning_year}_b$((first_gw + 60)).csv"
+            "results/${weather_run}/${result_subdir}/metrics/base_s_128___${planning_year}_b${first_gw}.csv"
+            "results/${weather_run}/${result_subdir}/metrics/base_s_128___${planning_year}_b$((first_gw + 60)).csv"
         )
         ;;
     *)
-        echo "BASELOAD_MODE must be pilot, full, or weather-2010." >&2
+        echo "BASELOAD_MODE must be pilot, full, weather-2010, or weather-2013." >&2
         exit 1
         ;;
 esac
