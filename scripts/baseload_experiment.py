@@ -5,6 +5,7 @@
 
 import copy
 import logging
+import math
 from pathlib import Path
 
 import pandas as pd
@@ -16,16 +17,24 @@ HEAT_CARRIER = "baseload_candidate_heat"
 
 def add_baseload_generators(
     n, capacity_gw, cost_file, cost_config, max_hours, availability_file,
-    district_heat=None,
+    district_heat=None, capacity_mode="fixed",
+    annualized_capex_eur_per_mw_year=0.0, variable_opex_eur_per_mwh=0.0,
 ):
-    """Offer zero-cost capacity with nuclear-like availability at every AC bus.
+    """Offer candidate capacity with nuclear-like availability at every AC bus.
 
-    Existing nuclear plants remain unchanged. The experiment's exact total
-    capacity is imposed in ``add_baseload_capacity_constraint``.
+    In fixed mode, ``add_baseload_capacity_constraint`` imposes an exact total.
+    Endogenous mode has no total or per-generator capacity upper bound.
     """
     capacity_gw = float(capacity_gw)
     if capacity_gw < 0:
         raise ValueError("Baseload capacity must be non-negative")
+    if capacity_mode not in {"fixed", "endogenous"}:
+        raise ValueError(f"Unknown baseload capacity mode: {capacity_mode}")
+    if any(
+        not math.isfinite(float(value)) or value < 0
+        for value in (annualized_capex_eur_per_mw_year, variable_opex_eur_per_mwh)
+    ):
+        raise ValueError("Baseload costs must be finite and non-negative")
     if capacity_gw == 0:
         return
 
@@ -57,18 +66,20 @@ def add_baseload_generators(
         bus=buses,
         carrier=CARRIER,
         p_nom_extendable=True,
-        p_nom_max=capacity_gw * 1e3,
+        p_nom_max=capacity_gw * 1e3 if capacity_mode == "fixed" else math.inf,
         p_max_pu=bus_availability.to_numpy(),
-        marginal_cost=0.0,
-        capital_cost=0.0,
+        marginal_cost=variable_opex_eur_per_mwh,
+        capital_cost=annualized_capex_eur_per_mw_year,
         efficiency=nuclear["efficiency"],
         lifetime=nuclear["lifetime"],
     )
     logger.info(
-        "Offered %.0f GW of zero-CAPEX, zero-OPEX baseload across %d AC buses; "
-        "nuclear-like availability, efficiency and lifetime",
-        capacity_gw,
+        "Offered %s baseload across %d AC buses; annualized CAPEX %.2f EUR/MW-year, "
+        "variable OPEX %.2f EUR/MWh; nuclear-like availability, efficiency and lifetime",
+        f"{capacity_gw:g} GW fixed" if capacity_mode == "fixed" else "endogenous",
         len(buses),
+        annualized_capex_eur_per_mw_year,
+        variable_opex_eur_per_mwh,
     )
 
     if district_heat.get("enabled", False):
@@ -87,7 +98,10 @@ def add_baseload_generators(
             bus1=heat_nodes + " urban central heat",
             carrier=HEAT_CARRIER,
             p_nom_extendable=True,
-            p_nom_max=capacity_gw * 1e3 * heat_penalty * heat_limit,
+            p_nom_max=(
+                capacity_gw * 1e3 * heat_penalty * heat_limit
+                if capacity_mode == "fixed" else math.inf
+            ),
             efficiency=1 / heat_penalty,
             marginal_cost=0.0,
             capital_cost=0.0,
@@ -111,6 +125,30 @@ def heat_coupling_parameters(options):
     if limit <= 0 or penalty * limit > 1:
         raise ValueError("Heat limit must be positive and leave non-negative net electricity")
     return penalty, limit
+
+
+def capex_opex_point(baseline_metrics, free_metrics, reference_gw, capex_share):
+    """Price the free reference case on its average annual break-even line."""
+    baseline = pd.read_csv(baseline_metrics).iloc[0]
+    free = pd.read_csv(free_metrics).iloc[0]
+    reference_gw = float(reference_gw)
+    capex_share = float(capex_share)
+    if not 0 < capex_share < 1 or reference_gw <= 0:
+        raise ValueError("CAPEX share must be in (0, 1) and reference GW positive")
+    if (
+        baseline["scenario"] != free["scenario"]
+        or baseline["weather_year"] != free["weather_year"]
+        or not math.isclose(float(baseline["built_gw"]), 0, abs_tol=1e-3)
+        or not math.isclose(float(free["built_gw"]), reference_gw, abs_tol=1e-3)
+    ):
+        raise ValueError("Baseline and free-case metrics do not match the reference")
+    saving = float(baseline["system_cost_eur_per_year"] - free["system_cost_eur_per_year"])
+    generation = float(free["baseload_generation_mwh"])
+    if not all(math.isfinite(v) and v > 0 for v in (saving, generation)):
+        raise ValueError("Reference saving and gross generation must be positive")
+    annualized_capex = capex_share * saving / (reference_gw * 1e3)
+    variable_opex = (1 - capex_share) * saving / generation
+    return annualized_capex, variable_opex
 
 
 def add_baseload_capacity_constraint(n, capacity_gw):
@@ -158,12 +196,18 @@ def add_baseload_heat_constraints(n, options):
         )
 
 
-def write_baseload_metrics(n, output_file, requested_gw, run_name):
+def write_baseload_metrics(
+    n, output_file, requested_gw, run_name, capacity_mode="fixed",
+    capex_share=None, annualized_capex_eur_per_mw_year=0.0,
+    variable_opex_eur_per_mwh=0.0,
+):
     """Write compact results so the sweep can be summarised without reloading networks."""
     names = n.generators.index[n.generators.carrier == CARRIER]
     built_mw = n.generators.loc[names, "p_nom_opt"].sum() if len(names) else 0.0
     requested_mw = float(requested_gw) * 1e3
-    if abs(built_mw - requested_mw) > max(1e-3, requested_mw * 1e-6):
+    if capacity_mode == "fixed" and abs(built_mw - requested_mw) > max(
+        1e-3, requested_mw * 1e-6
+    ):
         raise ValueError(f"Solved baseload capacity {built_mw} MW differs from {requested_mw} MW")
 
     generation_mwh = 0.0
@@ -209,6 +253,20 @@ def write_baseload_metrics(n, output_file, requested_gw, run_name):
         "baseload_electricity_loss_mwh": electricity_loss_mwh,
         "baseload_fixed_om_eur_per_year": fixed_om_eur,
     }
+    if capacity_mode == "endogenous":
+        row.update(
+            capacity_mode=capacity_mode,
+            reference_capacity_gw=float(requested_gw),
+            baseload_gw=built_mw / 1e3,
+            capex_share=float(capex_share),
+            annualized_capex_eur_per_mw_year=annualized_capex_eur_per_mw_year,
+            variable_opex_eur_per_mwh=variable_opex_eur_per_mwh,
+            baseload_fixed_om_eur_per_year=0.0,
+            baseload_annualized_capex_eur_per_year=fixed_om_eur,
+            baseload_variable_opex_eur_per_year=(
+                generation_mwh * variable_opex_eur_per_mwh
+            ),
+        )
     path = Path(output_file)
     path.parent.mkdir(parents=True, exist_ok=True)
     pd.DataFrame([row]).to_csv(path, index=False)

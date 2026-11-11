@@ -1042,7 +1042,8 @@ def extra_functionality(
             add_baseload_heat_constraints,
         )
 
-        add_baseload_capacity_constraint(n, capacity_gw)
+        if getattr(n.params, "baseload_capacity_mode", "fixed") == "fixed":
+            add_baseload_capacity_constraint(n, capacity_gw)
         district_heat = getattr(n.params, "baseload_district_heat", {})
         if district_heat.get("enabled", False):
             add_baseload_heat_constraints(n, district_heat)
@@ -1233,6 +1234,23 @@ if __name__ == "__main__":
     if hasattr(snakemake.params, "baseload_capacity_gw"):
         from baseload_experiment import add_baseload_generators
 
+        capacity_mode = getattr(snakemake.params, "baseload_capacity_mode", "fixed")
+        annualized_capex = 0.0
+        variable_opex = 0.0
+        if capacity_mode == "endogenous":
+            from baseload_experiment import capex_opex_point
+
+            annualized_capex, variable_opex = capex_opex_point(
+                snakemake.input.baseload_reference_baseline,
+                snakemake.input.baseload_reference_free,
+                snakemake.params.baseload_capacity_gw,
+                snakemake.params.baseload_cost_share,
+            )
+            logger.info(
+                "Endogenous baseload cost point: %.2f EUR/MW-year, %.2f EUR/MWh",
+                annualized_capex,
+                variable_opex,
+            )
         add_baseload_generators(
             n,
             capacity_gw=snakemake.params.baseload_capacity_gw,
@@ -1243,6 +1261,9 @@ if __name__ == "__main__":
             district_heat=snakemake.config["baseload_experiment"].get(
                 "district_heat", {}
             ),
+            capacity_mode=capacity_mode,
+            annualized_capex_eur_per_mw_year=annualized_capex,
+            variable_opex_eur_per_mwh=variable_opex,
         )
 
     logging_frequency = snakemake.config.get("solving", {}).get(
@@ -1273,6 +1294,10 @@ if __name__ == "__main__":
             snakemake.output.metrics,
             snakemake.params.baseload_capacity_gw,
             snakemake.wildcards.run,
+            capacity_mode=getattr(snakemake.params, "baseload_capacity_mode", "fixed"),
+            capex_share=getattr(snakemake.params, "baseload_cost_share", None),
+            annualized_capex_eur_per_mw_year=annualized_capex,
+            variable_opex_eur_per_mwh=variable_opex,
         )
 
     with open(snakemake.output.config, "w") as file:
