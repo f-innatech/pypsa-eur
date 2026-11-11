@@ -16,7 +16,10 @@ gurobi.log
 /bak
 /resources
 /resources*
-/results
+/results/*
+!/results/Plots Scripts/
+/results/Plots Scripts/*
+!/results/Plots Scripts/*.py
 /networks
 /benchmarks
 /logs

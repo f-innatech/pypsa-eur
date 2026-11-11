@@ -1,0 +1,5 @@
+# Solver settings for the 16-thread baseload rerun.
+solving:
+  solver_options:
+    gurobi-default:
+      threads: 16

@@ -37,6 +37,8 @@ if ! command -v conda >/dev/null 2>&1; then
     echo "Conda was not found. Load the cluster's Conda module in this script." >&2
     exit 1
 fi
+# Inherited Python paths can prevent Miniforge's own Python from importing Conda.
+unset PYTHONPATH PYTHONHOME
 eval "$(conda shell.bash hook)"
 conda activate pypsa-eur
 

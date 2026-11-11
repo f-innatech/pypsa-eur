@@ -4,7 +4,7 @@
 """Compare solved baseload networks by cost, generation, siting, and district heat.
 
 Example:
-    python scripts/compare_baseload_networks.py results/weather-2010/baseload/networks \
+    python "results/Plots Scripts/compare_baseload_networks.py" results/weather-2010/baseload/networks \
         --output-dir results/weather-2010/baseload/comparison
 
 Directories are searched recursively, so passing ``results`` compares all
@@ -43,6 +43,10 @@ CAPACITY_KEYS = ["component", "carrier", "unit", "capacity_basis"]
 DISTRICT_HEAT_CARRIER = "urban central heat"
 # These links move electricity or discharge storage; they are not generators.
 NON_GENERATION_LINKS = {"DC", "electricity distribution grid", "battery discharger"}
+CURTAILMENT_GENERATOR_CARRIERS = {
+    "onwind", "offwind-ac", "offwind-dc", "offwind-float",
+    "solar", "solar-hsat", "solar rooftop", "ror",
+}
 TRANSPORT_FUEL_LOAD_CARRIERS = {
     "land transport oil", "kerosene for aviation", "shipping oil", "shipping methanol",
 }
@@ -208,6 +212,52 @@ def electricity_generation_energy(network, weather_year, baseload_gw):
             rows.append(dict(weather_year=weather_year, baseload_gw=baseload_gw,
                              component="Link", carrier=carrier,
                              generation_twh=energy))
+    return rows
+
+
+def renewable_curtailment(network, weather_year, baseload_gw):
+    """Available minus dispatched wind, solar, and run-of-river electricity."""
+    electric_buses = set(
+        network.buses.index[network.buses.carrier.isin(["AC", "low voltage"])]
+    )
+    generators = active_assets(network.generators)
+    generators = generators.loc[
+        generators.carrier.isin(CURTAILMENT_GENERATOR_CARRIERS)
+        & generators.bus.isin(electric_buses)
+    ]
+    if generators.empty:
+        return []
+
+    names = generators.index
+    capacity_mw = nominal_capacity(generators, "p_nom", "p_nom_opt")
+    static_profile = pd.to_numeric(generators.p_max_pu, errors="coerce").fillna(1)
+    dynamic_profile = getattr(network.generators_t, "p_max_pu", pd.DataFrame())
+    availability = dynamic_profile.reindex(index=network.snapshots, columns=names)
+    availability = availability.fillna(static_profile)
+    weights = snapshot_weights(network)
+    available_mwh = availability.mul(weights, axis=0).sum().mul(capacity_mw)
+
+    dispatch = network.generators_t.p
+    if not names.isin(dispatch.columns).all():
+        raise ValueError("Solved network lacks renewable Generator dispatch")
+    generated_mwh = dispatch[names].mul(weights, axis=0).sum()
+    curtailed_mwh = (available_mwh - generated_mwh).clip(lower=0)
+
+    rows = []
+    for carrier, carrier_generators in generators.groupby("carrier"):
+        carrier_names = carrier_generators.index
+        potential = available_mwh.loc[carrier_names].sum() / 1e6
+        generated = generated_mwh.loc[carrier_names].sum() / 1e6
+        curtailed = curtailed_mwh.loc[carrier_names].sum() / 1e6
+        rows.append(dict(
+            weather_year=weather_year,
+            baseload_gw=baseload_gw,
+            carrier=carrier,
+            available_twh=potential,
+            generated_twh=generated,
+            curtailed_twh=curtailed,
+            curtailment_percent=100 * curtailed / potential if potential > 0 else np.nan,
+        ))
     return rows
 
 
@@ -823,6 +873,7 @@ def compare(network_files):
     capacities = []
     electric_generation = []
     electricity_energy = []
+    curtailment_rows = []
     final_energy_demand = []
     sector_profiles = {}
     baseload_nodes = []
@@ -856,6 +907,9 @@ def compare(network_files):
         )
         electricity_energy.extend(
             electricity_generation_energy(network, weather_year, baseload_gw)
+        )
+        curtailment_rows.extend(
+            renewable_curtailment(network, weather_year, baseload_gw)
         )
         final_energy_demand.extend(
             sector_final_energy_demand(network, weather_year, baseload_gw)
@@ -937,6 +991,12 @@ def compare(network_files):
     energy_table = energy_table.sort_values(
         ["weather_year", "baseload_gw", "component", "carrier"]
     )
+    curtailment_table = pd.DataFrame(curtailment_rows, columns=[
+        "weather_year", "baseload_gw", "carrier", "available_twh",
+        "generated_twh", "curtailed_twh", "curtailment_percent",
+    ]).sort_values(
+        ["weather_year", "baseload_gw", "carrier"]
+    )
     demand_table = pd.DataFrame(final_energy_demand).sort_values(
         ["weather_year", "baseload_gw", "sector", "carrier"]
     )
@@ -983,7 +1043,7 @@ def compare(network_files):
         )
         summary_table = summary_table.sort_values(["weather_year", "baseload_gw"])
     return (costs, cost_detail_table, capacity_table, generation_table,
-            energy_table, demand_table,
+            energy_table, curtailment_table, demand_table,
             profile_table,
             node_table, country_table,
             asset_table, load_table, summary_table)
@@ -1020,6 +1080,44 @@ def plot_costs(costs, output_file, case_steps):
     plt.close(fig)
 
 
+def format_bar_value(value):
+    if abs(value) >= 100:
+        return f"{value:,.0f}"
+    if abs(value) >= 1:
+        return f"{value:,.1f}"
+    return f"{value:,.2f}"
+
+
+def label_stacked_segments(ax, bars, heights, bottoms, totals, force=False):
+    """Label segments large enough to remain legible within their bars."""
+    from matplotlib import patheffects
+
+    scale = max(np.nanmax(totals), 1e-9)
+    for bar, height, bottom, total in zip(bars, heights, bottoms, totals):
+        if not np.isfinite(height) or height == 0:
+            continue
+        if not force and abs(height) < max(0.035 * total, 0.015 * scale):
+            continue
+        label = ax.text(
+            bar.get_x() + bar.get_width() / 2,
+            bottom + height / 2,
+            format_bar_value(height),
+            ha="center", va="center", fontsize=8, color="black",
+        )
+        label.set_path_effects([patheffects.withStroke(linewidth=2, foreground="white")])
+
+
+def label_grouped_bars(ax, bars, values, threshold):
+    for bar, value in zip(bars, values):
+        if value >= threshold:
+            ax.annotate(
+                format_bar_value(value),
+                (bar.get_x() + bar.get_width() / 2, bar.get_height()),
+                xytext=(0, 3), textcoords="offset points",
+                ha="center", va="bottom", rotation=90, fontsize=7,
+            )
+
+
 def plot_system_cost_breakdown(cost_details, costs, output_dir):
     """Show cost groups plus generation, storage, and grid technologies."""
     matplotlib.use("Agg")
@@ -1040,11 +1138,13 @@ def plot_system_cost_breakdown(cost_details, costs, output_dir):
         x = np.arange(len(values))
         positive = np.zeros(len(values))
         negative = np.zeros(len(values))
+        totals = values.abs().sum(axis=1).to_numpy(dtype=float)
         for i, label in enumerate(values.columns):
             height = values[label].to_numpy(dtype=float)
             bottom = np.where(height >= 0, positive, negative)
-            ax.bar(x, height, bottom=bottom, width=0.75,
-                   label=label, color=palette(label, i))
+            bars = ax.bar(x, height, bottom=bottom, width=0.75,
+                          label=label, color=palette(label, i))
+            label_stacked_segments(ax, bars, height, bottom, totals)
             positive += np.maximum(height, 0)
             negative += np.minimum(height, 0)
         ax.grid(axis="y", alpha=0.2)
@@ -1172,6 +1272,90 @@ def plot_capacity_changes(capacities, output_dir, case_steps, top_carriers=12):
         plt.close(fig)
 
 
+def plot_link_capacities(capacities, output_dir):
+    """Plot all installed Link capacities, with electrolysis highlighted."""
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+
+    links = capacities.loc[capacities.component == "Link"]
+    if links.empty:
+        return
+
+    def capacity_label(value):
+        if value >= 100:
+            return f"{value:,.0f}"
+        if value >= 1:
+            return f"{value:,.1f}"
+        return f"{value:,.3f}"
+
+    for (year, baseload_gw), group in links.groupby(["weather_year", "baseload_gw"]):
+        values = group.groupby("carrier").installed_capacity.sum()
+        electrolyzer = values.index.str.contains("electrolys", case=False, regex=False)
+        values = values.loc[(values > 1e-3) | electrolyzer].sort_values()
+        if values.empty:
+            continue
+
+        colors = [
+            "#d55e00" if "electrolys" in carrier.lower() else "#4477aa"
+            for carrier in values.index
+        ]
+        fig, ax = plt.subplots(figsize=(12, max(5, len(values) * 0.36 + 1.5)))
+        bars = ax.barh(values.index, values.to_numpy(), color=colors)
+        maximum = max(values.max(), 1)
+        padding = maximum * 0.008
+        for bar, value in zip(bars, values):
+            ax.text(
+                value + padding, bar.get_y() + bar.get_height() / 2,
+                capacity_label(value), va="center", fontsize=8,
+            )
+        ax.set_xlim(0, maximum * 1.16)
+        ax.set(
+            title=f"{year}: Link capacity with {baseload_gw:g} GW baseload",
+            xlabel="Installed Link input capacity at bus0 (model units / 1,000)",
+        )
+        ax.grid(axis="x", alpha=0.2)
+        ax.set_axisbelow(True)
+        fig.text(
+            0.01, 0.005,
+            "Orange: electrolysis. Energy inputs are GW; CO2-flow links use their native units / 1,000.",
+            fontsize=8,
+        )
+        fig.tight_layout(rect=(0, 0.02, 1, 1))
+        fig.savefig(output_dir / f"link_capacities_{year}_b{baseload_gw:g}.png", dpi=160,
+                    bbox_inches="tight")
+        plt.close(fig)
+
+    for year, group in links.groupby("weather_year"):
+        cases = sorted(group.baseload_gw.unique())
+        electrolyzer = group.loc[
+            group.carrier.str.contains("electrolys", case=False, regex=False)
+        ]
+        values = (
+            electrolyzer.groupby("baseload_gw").installed_capacity.sum()
+            .reindex(cases, fill_value=0)
+        )
+        fig, ax = plt.subplots(figsize=(max(6, len(cases) * 1.1), 4.5))
+        bars = ax.bar(range(len(cases)), values.to_numpy(), color="#d55e00")
+        maximum = max(values.max(), 1)
+        ax.set_ylim(0, maximum * 1.16)
+        for bar, value in zip(bars, values):
+            ax.text(
+                bar.get_x() + bar.get_width() / 2, value + maximum * 0.015,
+                capacity_label(value), ha="center", va="bottom", fontsize=9,
+            )
+        ax.set_xticks(range(len(cases)), [f"{case:g}" for case in cases])
+        ax.set(
+            title=f"{year}: installed electrolyzer capacity",
+            xlabel="Added baseload capacity (GW)",
+            ylabel="Electrolyzer electricity-input capacity (GW)",
+        )
+        ax.grid(axis="y", alpha=0.2)
+        ax.set_axisbelow(True)
+        fig.tight_layout()
+        fig.savefig(output_dir / f"electrolyzer_capacity_{year}.png", dpi=160)
+        plt.close(fig)
+
+
 def plot_stacked_carriers(table, value, cases, title, ylabel, output_file, demand=None):
     import matplotlib.pyplot as plt
 
@@ -1187,11 +1371,16 @@ def plot_stacked_carriers(table, value, cases, title, ylabel, output_file, deman
         return
     fig, ax = plt.subplots(figsize=(11, 5.5))
     bottom = np.zeros(len(cases))
+    totals = values.abs().sum(axis=1).to_numpy(dtype=float)
     palette = plt.get_cmap("tab20")
     for i, carrier in enumerate(values):
         height = values[carrier].to_numpy()
-        ax.bar(range(len(cases)), height, bottom=bottom,
-               color=palette(i % 20), label=carrier)
+        bars = ax.bar(range(len(cases)), height, bottom=bottom,
+                      color=palette(i % 20), label=carrier)
+        label_stacked_segments(
+            ax, bars, height, bottom, totals,
+            force=carrier == "baseload_candidate",
+        )
         bottom += height
     if demand is not None:
         ax.plot(range(len(cases)), demand.reindex(cases), "ko--",
@@ -1227,9 +1416,12 @@ def plot_electric_generation(generation, output_dir):
         x = np.arange(len(values))
         width = 0.8 / len(cases)
         fig, ax = plt.subplots(figsize=(max(12, 0.7 * len(values) + 5), 5.5))
+        peak = values.to_numpy().max()
         for i, capacity in enumerate(cases):
-            ax.bar(x + (i - (len(cases) - 1) / 2) * width,
-                   values[capacity], width=width, label=f"{capacity:g} GW")
+            bars = ax.bar(x + (i - (len(cases) - 1) / 2) * width,
+                          values[capacity], width=width, label=f"{capacity:g} GW")
+            label_grouped_bars(ax, bars, values[capacity], max(40, 0.04 * peak))
+        ax.set_ylim(0, peak * 1.22)
         ax.set_xticks(x, values.index, rotation=45, ha="right")
         ax.set(ylabel="Installed electrical capacity (GW)",
                title=f"{year}: generation technologies by baseload scenario")
@@ -1256,9 +1448,12 @@ def plot_electricity_generated(energy, output_dir):
         x = np.arange(len(values))
         width = 0.8 / len(cases)
         fig, ax = plt.subplots(figsize=(max(12, 0.8 * len(values) + 4), 5.5))
+        peak = values.to_numpy().max()
         for i, capacity in enumerate(cases):
-            ax.bar(x + (i - (len(cases) - 1) / 2) * width,
-                   values[capacity], width=width, label=f"{capacity:g} GW")
+            bars = ax.bar(x + (i - (len(cases) - 1) / 2) * width,
+                          values[capacity], width=width, label=f"{capacity:g} GW")
+            label_grouped_bars(ax, bars, values[capacity], max(20, 0.04 * peak))
+        ax.set_ylim(0, peak * 1.22)
         ax.set_xticks(x, values.index, rotation=45, ha="right")
         ax.set(ylabel="Annual electricity supplied (TWh)",
                title=f"{year}: electricity output by technology",
@@ -1267,6 +1462,53 @@ def plot_electricity_generated(energy, output_dir):
         ax.legend(title="Added baseload")
         fig.tight_layout()
         fig.savefig(output_dir / f"electricity_generation_{year}.png", dpi=160)
+        plt.close(fig)
+
+
+def plot_renewable_curtailment(curtailment, output_dir):
+    """Show annual curtailed electricity by weather-dependent source."""
+    import matplotlib.pyplot as plt
+
+    for year, group in curtailment.groupby("weather_year"):
+        cases = sorted(group.baseload_gw.unique())
+        values = group.pivot_table(
+            index="baseload_gw", columns="carrier", values="curtailed_twh",
+            aggfunc="sum", fill_value=0,
+        ).reindex(index=cases, fill_value=0)
+        values = values.loc[:, values.max().sort_values(ascending=False).index]
+        totals = values.sum(axis=1).to_numpy()
+        fig, ax = plt.subplots(figsize=(max(8, len(cases) * 1.2), 5.5))
+        bottom = np.zeros(len(cases))
+        palette = plt.get_cmap("tab20")
+        for i, carrier in enumerate(values):
+            heights = values[carrier].to_numpy()
+            ax.bar(range(len(cases)), heights, bottom=bottom,
+                   color=palette(i % palette.N), label=carrier)
+            for case_index, (height, base) in enumerate(zip(heights, bottom)):
+                if height >= max(5, totals[case_index] * 0.08):
+                    ax.text(case_index, base + height / 2, f"{height:,.0f}",
+                            ha="center", va="center", fontsize=8)
+            bottom += heights
+        maximum = max(totals.max(), 1)
+        for case_index, total in enumerate(totals):
+            ax.text(case_index, total + maximum * 0.015, f"{total:,.0f}",
+                    ha="center", va="bottom", fontsize=9)
+        ax.set_ylim(0, maximum * 1.16)
+        ax.set_xticks(range(len(cases)), [f"{case:g}" for case in cases])
+        ax.set(
+            title=f"{year}: renewable electricity curtailment by source",
+            xlabel="Added baseload capacity (GW)",
+            ylabel="Curtailed electricity (TWh/year)",
+        )
+        ax.grid(axis="y", alpha=0.2)
+        ax.set_axisbelow(True)
+        ax.legend(title="Generator carrier", loc="upper left",
+                  bbox_to_anchor=(1.01, 1), fontsize=8)
+        fig.text(0.01, 0.01,
+                 "Curtailment = available output (optimized capacity × p_max_pu) minus dispatch.",
+                 fontsize=8)
+        fig.tight_layout(rect=(0, 0.035, 0.78, 1))
+        fig.savefig(output_dir / f"renewable_curtailment_{year}.png", dpi=160)
         plt.close(fig)
 
 
@@ -1412,7 +1654,10 @@ def plot_district_heating(assets, summaries, output_dir):
             summaries.weather_year == year
         ].set_index("baseload_gw").reindex(cases)
         fig, axes = plt.subplots(1, 2, figsize=(10, 4))
-        axes[0].bar(range(len(cases)), year_summary.thermal_storage_capacity_gwh_th)
+        storage_values = year_summary.thermal_storage_capacity_gwh_th.to_numpy()
+        bars = axes[0].bar(range(len(cases)), storage_values)
+        label_grouped_bars(axes[0], bars, storage_values, 0)
+        axes[0].set_ylim(0, max(storage_values) * 1.16)
         axes[0].set(ylabel="Thermal storage energy (GWh)", title="Water-tank capacity")
         axes[1].plot(range(len(cases)), year_summary.storage_charge_twh_th,
                      marker="o", label="Charging")
@@ -1451,7 +1696,7 @@ def main():
     )
     args = parser.parse_args()
 
-    (costs, cost_details, capacities, generation, energy, demand, profiles,
+    (costs, cost_details, capacities, generation, energy, curtailment, demand, profiles,
      baseload_nodes, baseload_countries,
      heat_assets, heat_loads, heat_summary) = compare(find_networks(args.inputs))
     case_steps = (
@@ -1469,6 +1714,7 @@ def main():
     capacities.to_csv(args.output_dir / "installed_capacities.csv", index=False)
     generation.to_csv(args.output_dir / "generation_capacities.csv", index=False)
     energy.to_csv(args.output_dir / "electricity_generation_twh.csv", index=False)
+    curtailment.to_csv(args.output_dir / "renewable_curtailment_twh.csv", index=False)
     demand.to_csv(args.output_dir / "sector_final_energy_demand_twh.csv", index=False)
     profiles.to_csv(args.output_dir / "sector_load_profile_gw.csv", index=False)
     (args.output_dir / "sector_final_energy_demand_notes.txt").write_text(
@@ -1499,8 +1745,10 @@ def main():
     plot_costs(costs, args.output_dir / "system_costs.png", case_steps)
     plot_system_cost_breakdown(cost_details, costs, args.output_dir)
     plot_capacity_changes(capacities, args.output_dir, case_steps)
+    plot_link_capacities(capacities, args.output_dir)
     plot_electric_generation(generation, args.output_dir)
     plot_electricity_generated(energy, args.output_dir)
+    plot_renewable_curtailment(curtailment, args.output_dir)
     plot_sector_final_energy_demand(demand, energy, args.output_dir)
     plot_sector_load_profiles(profiles, args.output_dir)
     plot_baseload_siting(baseload_nodes, baseload_countries, args.output_dir)
