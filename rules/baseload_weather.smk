@@ -138,6 +138,7 @@ if config.get("baseload_cost_test", {}).get("enabled", False):
             baseload_capacity_gw=cost_test["reference_capacity_gw"],
             baseload_capacity_mode="endogenous",
             baseload_cost_share=lambda w: cost_cases[w.cost_case],
+            baseload_must_run=cost_test.get("must_run", False),
             baseload_district_heat=config["baseload_experiment"].get("district_heat", {}),
         input:
             network=resources(

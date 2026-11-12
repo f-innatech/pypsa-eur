@@ -1,11 +1,11 @@
 # Use after the 2050 and CHP overrides for the 2010 endogenous-cost test.
 baseload_cost_test:
   enabled: true
-  output_dir: baseload-chp-cost-test
+  output_dir: baseload-chp-cost-test-must-run
+  must_run: true
   reference_capacity_gw: 300
   reference_baseline_metrics: results/weather-2010/baseload-chp-free-opex/metrics/base_s_128___2050_b0.csv
   reference_free_metrics: results/weather-2010/baseload-chp-free-opex/metrics/base_s_128___2050_b300.csv
   capex_shares:
     capex80: 0.8
-    capex50: 0.5
     capex20: 0.2

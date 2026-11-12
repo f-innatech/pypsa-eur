@@ -1264,6 +1264,7 @@ if __name__ == "__main__":
             capacity_mode=capacity_mode,
             annualized_capex_eur_per_mw_year=annualized_capex,
             variable_opex_eur_per_mwh=variable_opex,
+            must_run=getattr(snakemake.params, "baseload_must_run", False),
         )
 
     logging_frequency = snakemake.config.get("solving", {}).get(
@@ -1298,6 +1299,7 @@ if __name__ == "__main__":
             capex_share=getattr(snakemake.params, "baseload_cost_share", None),
             annualized_capex_eur_per_mw_year=annualized_capex,
             variable_opex_eur_per_mwh=variable_opex,
+            must_run=getattr(snakemake.params, "baseload_must_run", False),
         )
 
     with open(snakemake.output.config, "w") as file:

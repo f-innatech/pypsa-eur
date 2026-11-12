@@ -1,11 +1,11 @@
 #!/usr/bin/env bash
-#SBATCH --job-name=baseload-cost-2010
+#SBATCH --job-name=baseload-mustrun-2010
 #SBATCH --partition=cpu_il
 #SBATCH --cpus-per-task=16
 #SBATCH --mem=120G
 #SBATCH --time=3-00:00:00
-#SBATCH --array=0-2%2
-#SBATCH --output=baseload-cost-2010-%A_%a.out
+#SBATCH --array=0-1%2
+#SBATCH --output=baseload-mustrun-2010-%A_%a.out
 
 set -euo pipefail
 cd "${SLURM_SUBMIT_DIR:?Submit from the pypsa-eur repository root}"
@@ -17,9 +17,8 @@ fi
 
 case "${SLURM_ARRAY_TASK_ID:-}" in
     0) cost_case=capex80 ;;
-    1) cost_case=capex50 ;;
-    2) cost_case=capex20 ;;
-    *) echo "Expected SLURM_ARRAY_TASK_ID between 0 and 2." >&2; exit 1 ;;
+    1) cost_case=capex20 ;;
+    *) echo "Expected SLURM_ARRAY_TASK_ID between 0 and 1." >&2; exit 1 ;;
 esac
 
 for input_file in \
@@ -62,7 +61,7 @@ if [[ ! -r "$GRB_LICENSE_FILE" ]]; then
     exit 1
 fi
 
-target="results/weather-2010/baseload-chp-cost-test/metrics/base_s_128___2050_cost_${cost_case}.csv"
+target="results/weather-2010/baseload-chp-cost-test-must-run/metrics/base_s_128___2050_cost_${cost_case}.csv"
 echo "Solving $target with 16 Gurobi threads on ${SLURM_JOB_NODELIST:-unknown node}"
 
 snakemake --snakefile Snakefile \

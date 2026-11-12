@@ -19,11 +19,13 @@ def add_baseload_generators(
     n, capacity_gw, cost_file, cost_config, max_hours, availability_file,
     district_heat=None, capacity_mode="fixed",
     annualized_capex_eur_per_mw_year=0.0, variable_opex_eur_per_mwh=0.0,
+    must_run=False,
 ):
     """Offer candidate capacity with nuclear-like availability at every AC bus.
 
     In fixed mode, ``add_baseload_capacity_constraint`` imposes an exact total.
     Endogenous mode has no total or per-generator capacity upper bound.
+    Must-run mode fixes dispatch at the country availability factor in every snapshot.
     """
     capacity_gw = float(capacity_gw)
     if capacity_gw < 0:
@@ -68,6 +70,7 @@ def add_baseload_generators(
         p_nom_extendable=True,
         p_nom_max=capacity_gw * 1e3 if capacity_mode == "fixed" else math.inf,
         p_max_pu=bus_availability.to_numpy(),
+        p_min_pu=bus_availability.to_numpy() if must_run else 0.0,
         marginal_cost=variable_opex_eur_per_mwh,
         capital_cost=annualized_capex_eur_per_mw_year,
         efficiency=nuclear["efficiency"],
@@ -81,6 +84,8 @@ def add_baseload_generators(
         annualized_capex_eur_per_mw_year,
         variable_opex_eur_per_mwh,
     )
+    if must_run:
+        logger.info("Baseload must run at the country availability factor in every snapshot")
 
     if district_heat.get("enabled", False):
         district_buses = n.buses.index[n.buses.carrier == "urban central heat"]
@@ -199,7 +204,7 @@ def add_baseload_heat_constraints(n, options):
 def write_baseload_metrics(
     n, output_file, requested_gw, run_name, capacity_mode="fixed",
     capex_share=None, annualized_capex_eur_per_mw_year=0.0,
-    variable_opex_eur_per_mwh=0.0,
+    variable_opex_eur_per_mwh=0.0, must_run=False,
 ):
     """Write compact results so the sweep can be summarised without reloading networks."""
     names = n.generators.index[n.generators.carrier == CARRIER]
@@ -256,6 +261,7 @@ def write_baseload_metrics(
     if capacity_mode == "endogenous":
         row.update(
             capacity_mode=capacity_mode,
+            must_run=bool(must_run),
             reference_capacity_gw=float(requested_gw),
             baseload_gw=built_mw / 1e3,
             capex_share=float(capex_share),
