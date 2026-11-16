@@ -1,0 +1,7 @@
+# Add after the 2050, CHP, offline and 16-thread overrides.
+baseload_energy_curve:
+  enabled: true
+  capacity_gw: 300
+  capacity_factors_percent: [10, 20, 30, 40, 50, 60, 70, 80, 90]
+  output_dir: baseload-chp-energy-curve
+  baseline_metrics: results/weather-2010/baseload-chp-free-opex/metrics/base_s_128___2050_b0.csv

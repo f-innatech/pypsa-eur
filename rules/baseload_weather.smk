@@ -184,3 +184,67 @@ if config.get("baseload_cost_test", {}).get("enabled", False):
             "../envs/environment.yaml"
         script:
             "../scripts/solve_network.py"
+
+
+if config.get("baseload_energy_curve", {}).get("enabled", False):
+    energy_curve = config["baseload_energy_curve"]
+    curve_capacity_gw = energy_curve["capacity_gw"]
+    curve_factors = energy_curve["capacity_factors_percent"]
+    if (
+        type(curve_capacity_gw) is not int
+        or curve_capacity_gw <= 0
+        or not curve_factors
+        or any(type(cf) is not int or not 0 < cf <= 100 for cf in curve_factors)
+        or curve_factors != sorted(set(curve_factors))
+    ):
+        raise ValueError("Energy curve needs positive integer GW and sorted unique CF percentages")
+    curve_dir = energy_curve["output_dir"]
+    curve_cf_wildcard = "|".join(str(cf) for cf in curve_factors)
+    curve_stem = (
+        "base_s_{clusters}_{opts}_{sector_opts}_{planning_horizons}"
+        + f"_b{curve_capacity_gw}_cf{{cf_percent}}"
+    )
+
+    rule solve_baseload_energy_case:
+        wildcard_constraints:
+            run="weather-2010",
+            cf_percent=curve_cf_wildcard,
+        params:
+            solving=config_provider("solving"),
+            foresight=config_provider("foresight"),
+            co2_sequestration_potential=config_provider(
+                "sector", "co2_sequestration_potential", default=200
+            ),
+            custom_extra_functionality=input_custom_extra_functionality,
+            baseload_capacity_gw=curve_capacity_gw,
+            baseload_target_capacity_factor=lambda w: int(w.cf_percent) / 100,
+            baseload_district_heat=config["baseload_experiment"].get("district_heat", {}),
+        input:
+            network=resources(
+                "networks/base_s_{clusters}_{opts}_{sector_opts}_{planning_horizons}.nc"
+            ),
+            baseload_costs=lambda w: resources(
+                f"costs_{config_provider('costs', 'year')(w)}.csv"
+            ),
+            baseload_availability=config["baseload_experiment"]["availability_file"],
+            baseload_reference_baseline=energy_curve["baseline_metrics"],
+        output:
+            network=RESULTS + curve_dir + "/networks/" + curve_stem + ".nc",
+            config=RESULTS + curve_dir + "/configs/" + curve_stem + ".yaml",
+            metrics=RESULTS + curve_dir + "/metrics/" + curve_stem + ".csv",
+        shadow:
+            shadow_config
+        log:
+            solver=RESULTS + curve_dir + "/logs/" + curve_stem + "_solver.log",
+            memory=RESULTS + curve_dir + "/logs/" + curve_stem + "_memory.log",
+            python=RESULTS + curve_dir + "/logs/" + curve_stem + "_python.log",
+        threads: solver_threads
+        resources:
+            mem_mb=config_provider("solving", "mem_mb"),
+            runtime=config_provider("solving", "runtime", default="6h"),
+        benchmark:
+            RESULTS + curve_dir + "/benchmarks/" + curve_stem
+        conda:
+            "../envs/environment.yaml"
+        script:
+            "../scripts/solve_network.py"

@@ -170,6 +170,29 @@ def add_baseload_capacity_constraint(n, capacity_gw):
     )
 
 
+def add_baseload_energy_constraint(n, capacity_gw, target_capacity_factor):
+    """Fix annual gross candidate generation at the requested capacity factor."""
+    target_capacity_factor = float(target_capacity_factor)
+    if not 0 < target_capacity_factor <= 1:
+        raise ValueError("Target capacity factor must be in (0, 1]")
+    names = n.generators.index[n.generators.carrier == CARRIER]
+    if names.empty:
+        raise ValueError("Baseload energy requested without candidate generators")
+    target_mwh = (
+        float(capacity_gw)
+        * 1e3
+        * n.snapshot_weightings.generators.sum()
+        * target_capacity_factor
+    )
+    generation = (
+        n.model["Generator-p"].loc[:, names]
+        * n.snapshot_weightings.generators
+    ).sum()
+    n.model.add_constraints(
+        generation == target_mwh, name="baseload_candidate_energy"
+    )
+
+
 def add_baseload_heat_constraints(n, options):
     """Tie each free heat link to its colocated baseload generator.
 
@@ -205,6 +228,8 @@ def write_baseload_metrics(
     n, output_file, requested_gw, run_name, capacity_mode="fixed",
     capex_share=None, annualized_capex_eur_per_mw_year=0.0,
     variable_opex_eur_per_mwh=0.0, must_run=False,
+    target_capacity_factor=None, baseline_cost_eur_per_year=None,
+    energy_constraint_dual_eur_per_mwh=None,
 ):
     """Write compact results so the sweep can be summarised without reloading networks."""
     names = n.generators.index[n.generators.carrier == CARRIER]
@@ -258,6 +283,32 @@ def write_baseload_metrics(
         "baseload_electricity_loss_mwh": electricity_loss_mwh,
         "baseload_fixed_om_eur_per_year": fixed_om_eur,
     }
+    if target_capacity_factor is not None:
+        target_mwh = (
+            requested_mw
+            * n.snapshot_weightings.generators.sum()
+            * target_capacity_factor
+        )
+        if abs(generation_mwh - target_mwh) > max(1.0, target_mwh * 1e-8):
+            raise ValueError(
+                f"Baseload generation {generation_mwh} MWh differs from "
+                f"target {target_mwh} MWh"
+            )
+        row.update(
+            target_capacity_factor=target_capacity_factor,
+            actual_capacity_factor=generation_mwh
+            / (built_mw * n.snapshot_weightings.generators.sum()),
+            baseload_generation_target_mwh=target_mwh,
+            energy_constraint_dual_eur_per_mwh=energy_constraint_dual_eur_per_mwh,
+            marginal_system_value_eur_per_mwh=(
+                -energy_constraint_dual_eur_per_mwh
+                if energy_constraint_dual_eur_per_mwh is not None else None
+            ),
+        )
+        if baseline_cost_eur_per_year is not None:
+            row["system_value_eur_per_year"] = (
+                baseline_cost_eur_per_year - n.objective
+            )
     if capacity_mode == "endogenous":
         row.update(
             capacity_mode=capacity_mode,

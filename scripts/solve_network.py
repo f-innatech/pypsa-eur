@@ -1039,11 +1039,17 @@ def extra_functionality(
     if capacity_gw := getattr(n.params, "baseload_capacity_gw", 0):
         from baseload_experiment import (
             add_baseload_capacity_constraint,
+            add_baseload_energy_constraint,
             add_baseload_heat_constraints,
         )
 
         if getattr(n.params, "baseload_capacity_mode", "fixed") == "fixed":
             add_baseload_capacity_constraint(n, capacity_gw)
+        target_capacity_factor = getattr(
+            n.params, "baseload_target_capacity_factor", None
+        )
+        if target_capacity_factor is not None:
+            add_baseload_energy_constraint(n, capacity_gw, target_capacity_factor)
         district_heat = getattr(n.params, "baseload_district_heat", {})
         if district_heat.get("enabled", False):
             add_baseload_heat_constraints(n, district_heat)
@@ -1290,6 +1296,23 @@ if __name__ == "__main__":
     if getattr(snakemake.output, "metrics", None):
         from baseload_experiment import write_baseload_metrics
 
+        target_capacity_factor = getattr(
+            snakemake.params, "baseload_target_capacity_factor", None
+        )
+        baseline_cost = None
+        energy_dual = None
+        if target_capacity_factor is not None:
+            baseline = pd.read_csv(snakemake.input.baseload_reference_baseline).iloc[0]
+            if (
+                baseline["scenario"] != snakemake.wildcards.run
+                or int(baseline["weather_year"]) != pd.Timestamp(n.snapshots[0]).year
+                or abs(float(baseline["built_gw"])) > 1e-3
+            ):
+                raise ValueError("Baseload energy-curve baseline does not match this run")
+            baseline_cost = float(baseline["system_cost_eur_per_year"])
+            energy_dual = float(
+                n.model.constraints["baseload_candidate_energy"].dual.item()
+            )
         write_baseload_metrics(
             n,
             snakemake.output.metrics,
@@ -1300,6 +1323,9 @@ if __name__ == "__main__":
             annualized_capex_eur_per_mw_year=annualized_capex,
             variable_opex_eur_per_mwh=variable_opex,
             must_run=getattr(snakemake.params, "baseload_must_run", False),
+            target_capacity_factor=target_capacity_factor,
+            baseline_cost_eur_per_year=baseline_cost,
+            energy_constraint_dual_eur_per_mwh=energy_dual,
         )
 
     with open(snakemake.output.config, "w") as file:
