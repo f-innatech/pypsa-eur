@@ -16,16 +16,17 @@ HEAT_CARRIER = "baseload_candidate_heat"
 
 
 def add_baseload_generators(
-    n, capacity_gw, cost_file, cost_config, max_hours, availability_file,
+    n, capacity_gw, cost_file, cost_config, max_hours, availability_file=None,
     district_heat=None, capacity_mode="fixed",
     annualized_capex_eur_per_mw_year=0.0, variable_opex_eur_per_mwh=0.0,
     must_run=False,
 ):
-    """Offer candidate capacity with nuclear-like availability at every AC bus.
+    """Offer candidate capacity at every AC bus.
 
     In fixed mode, ``add_baseload_capacity_constraint`` imposes an exact total.
     Endogenous mode has no total or per-generator capacity upper bound.
-    Must-run mode fixes dispatch at the country availability factor in every snapshot.
+    With no availability file, candidates can dispatch up to nameplate capacity.
+    Must-run mode fixes dispatch at the available capacity in every snapshot.
     """
     capacity_gw = float(capacity_gw)
     if capacity_gw < 0:
@@ -54,12 +55,16 @@ def add_baseload_generators(
     district_heat = district_heat or {}
     if district_heat.get("enabled", False):
         heat_penalty, heat_limit = heat_coupling_parameters(district_heat)
-    availability = pd.read_csv(availability_file, index_col="country")["factor"]
-    if availability.empty or not availability.between(0, 1, inclusive="right").all():
-        raise ValueError("Nuclear availability factors must be in (0, 1]")
-    bus_availability = (
-        n.buses.loc[buses, "country"].map(availability).fillna(availability.median())
-    )
+    if availability_file is None:
+        bus_availability = 1.0
+        logger.info("Baseload candidates can dispatch up to full nameplate capacity")
+    else:
+        availability = pd.read_csv(availability_file, index_col="country")["factor"]
+        if availability.empty or not availability.between(0, 1, inclusive="right").all():
+            raise ValueError("Baseload availability factors must be in (0, 1]")
+        bus_availability = (
+            n.buses.loc[buses, "country"].map(availability).fillna(availability.median())
+        ).to_numpy()
 
     n.add("Carrier", CARRIER, co2_emissions=0)
     n.add(
@@ -69,8 +74,8 @@ def add_baseload_generators(
         carrier=CARRIER,
         p_nom_extendable=True,
         p_nom_max=capacity_gw * 1e3 if capacity_mode == "fixed" else math.inf,
-        p_max_pu=bus_availability.to_numpy(),
-        p_min_pu=bus_availability.to_numpy() if must_run else 0.0,
+        p_max_pu=bus_availability,
+        p_min_pu=bus_availability if must_run else 0.0,
         marginal_cost=variable_opex_eur_per_mwh,
         capital_cost=annualized_capex_eur_per_mw_year,
         efficiency=nuclear["efficiency"],
@@ -78,14 +83,14 @@ def add_baseload_generators(
     )
     logger.info(
         "Offered %s baseload across %d AC buses; annualized CAPEX %.2f EUR/MW-year, "
-        "variable OPEX %.2f EUR/MWh; nuclear-like availability, efficiency and lifetime",
+        "variable OPEX %.2f EUR/MWh; nuclear-like efficiency and lifetime",
         f"{capacity_gw:g} GW fixed" if capacity_mode == "fixed" else "endogenous",
         len(buses),
         annualized_capex_eur_per_mw_year,
         variable_opex_eur_per_mwh,
     )
     if must_run:
-        logger.info("Baseload must run at the country availability factor in every snapshot")
+        logger.info("Baseload must run at available capacity in every snapshot")
 
     if district_heat.get("enabled", False):
         district_buses = n.buses.index[n.buses.carrier == "urban central heat"]

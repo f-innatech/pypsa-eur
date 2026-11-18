@@ -1263,7 +1263,7 @@ if __name__ == "__main__":
             cost_file=snakemake.input.baseload_costs,
             cost_config=snakemake.config["costs"],
             max_hours=snakemake.config["electricity"]["max_hours"],
-            availability_file=snakemake.input.baseload_availability,
+            availability_file=getattr(snakemake.input, "baseload_availability", None),
             district_heat=snakemake.config["baseload_experiment"].get(
                 "district_heat", {}
             ),

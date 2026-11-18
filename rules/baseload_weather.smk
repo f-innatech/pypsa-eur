@@ -226,7 +226,6 @@ if config.get("baseload_energy_curve", {}).get("enabled", False):
             baseload_costs=lambda w: resources(
                 f"costs_{config_provider('costs', 'year')(w)}.csv"
             ),
-            baseload_availability=config["baseload_experiment"]["availability_file"],
             baseload_reference_baseline=energy_curve["baseline_metrics"],
         output:
             network=RESULTS + curve_dir + "/networks/" + curve_stem + ".nc",

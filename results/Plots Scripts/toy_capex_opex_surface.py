@@ -205,10 +205,20 @@ def save_results(samples, history, baseline_cost, outdir: Path):
     X, Y = np.meshgrid(opex, cf)
     break_even_capex = value[:, None] - X * (8.76 * Y)  # kEUR/MW-year
     Z = np.where(break_even_capex >= 0, break_even_capex, np.nan)
-    fig = plt.figure(figsize=(9, 6))
+    # The colour is the gross annual system saving at zero plant costs. It
+    # depends on capacity factor, but not on the OPEX shown on the x-axis.
+    saved_million_eur_per_year = value * CAPACITY_MW / 1000
+    color_norm = matplotlib.colors.Normalize(
+        vmin=0, vmax=float(saved_million_eur_per_year.max())
+    )
+    color_map = plt.colormaps["viridis"]
+    facecolors = color_map(
+        color_norm(np.broadcast_to(saved_million_eur_per_year[:, None], Z.shape))
+    )
+    fig = plt.figure(figsize=(10.5, 6.5))
     ax = fig.add_subplot(111, projection="3d")
     ax.plot_surface(
-        X, Y, Z, cmap="viridis", alpha=0.9, linewidth=0, antialiased=True,
+        X, Y, Z, facecolors=facecolors, shade=False, linewidth=0, antialiased=True,
         rcount=len(cf), ccount=len(opex),
     )
     zero_opex = value[1:] / (8.76 * cf[1:])
@@ -222,8 +232,13 @@ def save_results(samples, history, baseline_cost, outdir: Path):
         title="Interpolated break-even surface (fixed 60 MW)",
     )
     ax.view_init(elev=25, azim=-60)
+    fig.colorbar(
+        matplotlib.cm.ScalarMappable(norm=color_norm, cmap=color_map),
+        ax=ax, shrink=0.65, pad=0.12,
+        label="Avoided system cost with free plant (million EUR/year)",
+    )
     fig.tight_layout()
-    fig.savefig(outdir / "break_even_surface.png", dpi=180)
+    fig.savefig(outdir / "break_even_surface_system_value_colored.png", dpi=180)
     plt.close(fig)
 
     # With unrestricted dispatch, the plant selects the best point on this

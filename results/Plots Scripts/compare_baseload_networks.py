@@ -10,6 +10,9 @@ Example:
 Directories are searched recursively, so passing ``results`` compares all
 downloaded weather years. Missing capacity cases are allowed. Each network is
 loaded separately to limit memory use.
+
+Use --by-capacity-factor to compare fixed-capacity runs named *_b300_cf10.nc,
+etc. In this mode --baseline can add a matching 0 GW reference network.
 """
 
 import argparse
@@ -17,6 +20,7 @@ import gc
 import math
 import re
 from pathlib import Path
+from typing import NamedTuple
 
 import matplotlib
 import numpy as np
@@ -25,6 +29,39 @@ import pypsa
 
 
 CAPACITY_IN_FILENAME = re.compile(r"_b(?P<gw>\d+(?:\.\d+)?)\.nc$")
+CAPACITY_FACTOR_IN_FILENAME = re.compile(
+    r"_b(?P<gw>\d+(?:\.\d+)?)_cf(?P<cf>\d{1,3})\.nc$"
+)
+
+
+class CaseAxis(NamedTuple):
+    column: str
+    baseline: float
+    xlabel: str
+    legend_title: str
+
+    def label(self, value):
+        if self.column == "baseload_gw" or value == self.baseline:
+            return f"{max(value, 0):g} GW"
+        return f"{value:g}%"
+
+    def ticks(self, values):
+        if self.column == "baseload_gw":
+            return [f"{value:g}" for value in values]
+        return [self.label(value) for value in values]
+
+    def file_suffix(self, value):
+        if self.column == "baseload_gw":
+            return f"b{value:g}"
+        return "b0" if value == self.baseline else f"cf{value:g}"
+
+
+CAPACITY_AXIS = CaseAxis("baseload_gw", 0, "Added baseload capacity (GW)", "Added baseload")
+# A zero-capacity reference has no defined capacity factor.
+CAPACITY_FACTOR_AXIS = CaseAxis(
+    "capacity_factor_percent", -1, "Gross baseload capacity factor", "Capacity factor"
+)
+
 # Link p_nom is the power at bus0, not output power at its other ports.
 CAPACITY_COMPONENTS = (
     ("Generator", "generators", "p_nom", "p_nom_opt", "GW", "output power"),
@@ -65,7 +102,7 @@ OBJECTIVE_COMPONENTS = (
 )
 
 
-def find_networks(inputs):
+def find_networks(inputs, case_axis=CAPACITY_AXIS):
     files = []
     for item in inputs:
         if item.is_file():
@@ -74,9 +111,17 @@ def find_networks(inputs):
             files.extend(item.rglob("*.nc"))
         else:
             raise FileNotFoundError(item)
-    files = sorted({path.resolve() for path in files if CAPACITY_IN_FILENAME.search(path.name)})
+    pattern = (
+        CAPACITY_FACTOR_IN_FILENAME if case_axis == CAPACITY_FACTOR_AXIS
+        else CAPACITY_IN_FILENAME
+    )
+    files = sorted({path.resolve() for path in files if pattern.search(path.name)})
     if not files:
-        raise ValueError("No solved baseload networks (*_b0.nc, *_b60.nc, ...) found")
+        example = (
+            "*_b300_cf10.nc, ..." if case_axis == CAPACITY_FACTOR_AXIS
+            else "*_b0.nc, *_b60.nc, ..."
+        )
+        raise ValueError(f"No solved baseload networks ({example}) found")
     return files
 
 
@@ -867,7 +912,12 @@ def district_heating(network, weather_year, baseload_gw):
     return asset_rows, load_rows, summary
 
 
-def compare(network_files):
+def compare(network_files, case_axis=CAPACITY_AXIS):
+    case_col = case_axis.column
+    by_cf = case_axis == CAPACITY_FACTOR_AXIS
+    case_keys = ["weather_year", "baseload_gw"]
+    if by_cf:
+        case_keys.insert(1, case_col)
     costs = []
     cost_details = []
     capacities = []
@@ -881,55 +931,79 @@ def compare(network_files):
     heat_loads = []
     heat_summaries = []
     seen = set()
+    fixed_capacities = {}
     for path in network_files:
-        baseload_gw = float(CAPACITY_IN_FILENAME.search(path.name).group("gw"))
+        cf_match = CAPACITY_FACTOR_IN_FILENAME.search(path.name) if by_cf else None
+        match = cf_match or CAPACITY_IN_FILENAME.search(path.name)
+        baseload_gw = float(match["gw"])
+        if cf_match:
+            case = int(cf_match["cf"])
+            if not 0 <= case <= 100 or baseload_gw <= 0:
+                raise ValueError(f"Invalid capacity-factor case: {path.name}")
+        else:
+            case = case_axis.baseline if by_cf else baseload_gw
+
         network = pypsa.Network(path)
         weather_year = pd.Timestamp(network.snapshots[0]).year
-        key = (weather_year, baseload_gw)
+        if cf_match and baseload_gw != fixed_capacities.setdefault(weather_year, baseload_gw):
+            raise ValueError(f"Capacity-factor cases for {weather_year} must use the same GW")
+        key = (weather_year, case)
         if key in seen:
-            raise ValueError(f"Duplicate weather year and baseload capacity: {key}")
+            raise ValueError(f"Duplicate {weather_year} case: {case_axis.label(case)}")
         seen.add(key)
         objective = float(network.objective)
         if not math.isfinite(objective):
             raise ValueError(f"Network has no finite objective: {path}")
+
+        def tag_rows(rows):
+            for row in rows:
+                row[case_col] = case
+            return rows
+
         costs.append(
             {
                 "weather_year": weather_year,
                 "baseload_gw": baseload_gw,
+                case_col: case,
                 "system_cost_eur_per_year": objective,
                 "network_file": str(path),
             }
         )
-        cost_details.append(system_cost_breakdown(network, weather_year, baseload_gw))
-        capacities.extend(installed_capacities(network, weather_year, baseload_gw))
+        cost_details.append(
+            system_cost_breakdown(network, weather_year, baseload_gw).assign(**{case_col: case})
+        )
+        capacities.extend(tag_rows(installed_capacities(network, weather_year, baseload_gw)))
         electric_generation.extend(
-            electric_generation_capacities(network, weather_year, baseload_gw)
+            tag_rows(electric_generation_capacities(network, weather_year, baseload_gw))
         )
         electricity_energy.extend(
-            electricity_generation_energy(network, weather_year, baseload_gw)
+            tag_rows(electricity_generation_energy(network, weather_year, baseload_gw))
         )
         curtailment_rows.extend(
-            renewable_curtailment(network, weather_year, baseload_gw)
+            tag_rows(renewable_curtailment(network, weather_year, baseload_gw))
         )
         final_energy_demand.extend(
-            sector_final_energy_demand(network, weather_year, baseload_gw)
+            tag_rows(sector_final_energy_demand(network, weather_year, baseload_gw))
         )
-        if weather_year not in sector_profiles or baseload_gw == 0:
+        if weather_year not in sector_profiles or case < sector_profiles[weather_year][1]:
             sector_profiles[weather_year] = (
-                baseload_gw, sector_load_profile(network)
+                baseload_gw, case, sector_load_profile(network)
             )
-        baseload_nodes.append(baseload_siting(network, weather_year, baseload_gw))
+        baseload_nodes.append(
+            baseload_siting(network, weather_year, baseload_gw).assign(**{case_col: case})
+        )
         assets, loads, summary = district_heating(network, weather_year, baseload_gw)
-        heat_assets.extend(assets)
-        heat_loads.extend(loads)
+        heat_assets.extend(tag_rows(assets))
+        heat_loads.extend(tag_rows(loads))
         if summary is not None:
+            summary[case_col] = case
             heat_summaries.append(summary)
-        print(f"Loaded {path.name}: {objective / 1e9:.2f} billion EUR/year")
+        print(f"Loaded {path.name}: {objective / 1e9:.2f} billion EUR/year", flush=True)
         del network
         gc.collect()
 
-    costs = pd.DataFrame(costs).sort_values(["weather_year", "baseload_gw"])
-    baseline_cost = costs.loc[costs.baseload_gw == 0].set_index("weather_year")
+    costs = pd.DataFrame(costs).sort_values(case_keys)
+    baseline_cost = costs.loc[costs[case_col] == case_axis.baseline].set_index("weather_year")
     costs["baseline_cost_eur_per_year"] = costs.weather_year.map(
         baseline_cost.system_cost_eur_per_year
     )
@@ -937,42 +1011,44 @@ def compare(network_files):
         costs.baseline_cost_eur_per_year - costs.system_cost_eur_per_year
     )
     cost_detail_table = pd.concat(cost_details, ignore_index=True).sort_values(
-        ["weather_year", "baseload_gw", "category", "component", "carrier"]
+        case_keys + ["category", "component", "carrier"]
     )
 
     capacity_tables = []
     raw = pd.DataFrame(capacities)
     for weather_year, group in costs.groupby("weather_year"):
-        cases = group.baseload_gw.tolist()
+        cases = group[case_col].tolist()
         year_capacities = raw.loc[raw.weather_year == weather_year]
         wide = year_capacities.pivot_table(
             index=CAPACITY_KEYS,
-            columns="baseload_gw",
+            columns=case_col,
             values="installed_capacity",
             aggfunc="sum",
             fill_value=0,
         ).reindex(columns=cases, fill_value=0)
-        baseline = wide[0.0] if 0.0 in wide else pd.Series(float("nan"), index=wide.index)
-        for baseload_gw in cases:
-            table = wide[[baseload_gw]].rename(
-                columns={baseload_gw: "installed_capacity"}
+        baseline = wide.get(case_axis.baseline, pd.Series(float("nan"), index=wide.index))
+        for case, baseload_gw in zip(cases, group.baseload_gw):
+            table = wide[[case]].rename(
+                columns={case: "installed_capacity"}
             ).reset_index()
             table.insert(0, "weather_year", weather_year)
             table.insert(1, "baseload_gw", baseload_gw)
+            if by_cf:
+                table.insert(2, case_col, case)
             table["baseline_capacity"] = baseline.to_numpy()
             table["delta_vs_baseline"] = (
                 table.installed_capacity - table.baseline_capacity
             )
             capacity_tables.append(table)
     capacity_table = pd.concat(capacity_tables, ignore_index=True).sort_values(
-        ["weather_year", "baseload_gw", "component", "carrier"]
+        case_keys + ["component", "carrier"]
     )
     generation_table = pd.DataFrame(electric_generation)
     generation_table = generation_table.groupby(
-        ["weather_year", "baseload_gw", "component", "carrier"], as_index=False
+        case_keys + ["component", "carrier"], as_index=False
     ).installed_capacity_gw_e.sum()
     baseline_generation = generation_table.loc[
-        generation_table.baseload_gw == 0,
+        generation_table[case_col] == case_axis.baseline,
         ["weather_year", "component", "carrier", "installed_capacity_gw_e"],
     ].rename(columns={"installed_capacity_gw_e": "baseline_capacity_gw_e"})
     generation_table = generation_table.merge(
@@ -986,32 +1062,32 @@ def compare(network_files):
         generation_table.installed_capacity_gw_e - generation_table.baseline_capacity_gw_e
     )
     energy_table = pd.DataFrame(electricity_energy).groupby(
-        ["weather_year", "baseload_gw", "component", "carrier"], as_index=False
+        case_keys + ["component", "carrier"], as_index=False
     ).generation_twh.sum()
     energy_table = energy_table.sort_values(
-        ["weather_year", "baseload_gw", "component", "carrier"]
+        case_keys + ["component", "carrier"]
     )
-    curtailment_table = pd.DataFrame(curtailment_rows, columns=[
-        "weather_year", "baseload_gw", "carrier", "available_twh",
+    curtailment_table = pd.DataFrame(curtailment_rows, columns=case_keys + [
+        "carrier", "available_twh",
         "generated_twh", "curtailed_twh", "curtailment_percent",
     ]).sort_values(
-        ["weather_year", "baseload_gw", "carrier"]
+        case_keys + ["carrier"]
     )
     demand_table = pd.DataFrame(final_energy_demand).sort_values(
-        ["weather_year", "baseload_gw", "sector", "carrier"]
+        case_keys + ["sector", "carrier"]
     )
     profile_table = pd.concat(
         [
-            profile.assign(weather_year=year, baseload_gw=capacity)
-            for year, (capacity, profile) in sorted(sector_profiles.items())
+            profile.assign(**{"weather_year": year, "baseload_gw": capacity, case_col: case})
+            for year, (capacity, case, profile) in sorted(sector_profiles.items())
         ]
     ).reset_index().sort_values(["weather_year", "Time"])
 
     node_table = pd.concat(baseload_nodes, ignore_index=True).sort_values(
-        ["weather_year", "baseload_gw", "country", "node"]
+        case_keys + ["country", "node"]
     )
     country_table = node_table.groupby(
-        ["weather_year", "baseload_gw", "country"], as_index=False
+        case_keys + ["country"], as_index=False
     )[["installed_capacity_gw", "generation_twh"]].sum()
     country_table["capacity_share_percent"] = np.where(
         country_table.baseload_gw > 0,
@@ -1027,7 +1103,7 @@ def compare(network_files):
 
     asset_table = pd.DataFrame(heat_assets)
     if not asset_table.empty:
-        keys = ["weather_year", "baseload_gw", "component", "carrier", "role", "cost_scope"]
+        keys = case_keys + ["component", "carrier", "role", "cost_scope"]
         asset_table = asset_table.groupby(keys, as_index=False).sum(numeric_only=True)
         asset_table["direct_asset_cost_bn_eur"] = (
             asset_table.annualized_fixed_cost_bn_eur
@@ -1041,7 +1117,7 @@ def compare(network_files):
             summary_table.dedicated_heat_asset_fixed_cost_bn_eur
             + summary_table.dedicated_heat_asset_variable_cost_bn_eur
         )
-        summary_table = summary_table.sort_values(["weather_year", "baseload_gw"])
+        summary_table = summary_table.sort_values(case_keys)
     return (costs, cost_detail_table, capacity_table, generation_table,
             energy_table, curtailment_table, demand_table,
             profile_table,
@@ -1049,14 +1125,14 @@ def compare(network_files):
             asset_table, load_table, summary_table)
 
 
-def plot_costs(costs, output_file, case_steps):
+def plot_costs(costs, output_file, case_steps, case_axis=CAPACITY_AXIS):
     matplotlib.use("Agg")
     import matplotlib.pyplot as plt
 
     fig, axes = plt.subplots(1, 2, figsize=(12, 4.5), sharex=True)
     for year, group in costs.groupby("weather_year"):
         # Leave visible gaps where an expected case has not been downloaded.
-        group = group.set_index("baseload_gw").reindex(case_steps)
+        group = group.set_index(case_axis.column).reindex(case_steps)
         axes[0].plot(
             group.index,
             group.system_cost_eur_per_year / 1e9,
@@ -1072,7 +1148,9 @@ def plot_costs(costs, output_file, case_steps):
     axes[0].set(ylabel="System cost (billion EUR/year)", title="Optimized system cost")
     axes[1].set(ylabel="Saving (billion EUR/year)", title="Relative to 0 GW baseline")
     for ax in axes:
-        ax.set(xlabel="Added baseload capacity (GW)")
+        ax.set(xlabel=case_axis.xlabel)
+        if case_axis == CAPACITY_FACTOR_AXIS:
+            ax.set_xticks(case_steps, case_axis.ticks(case_steps))
         ax.grid(alpha=0.25)
         ax.legend(title="Weather year")
     fig.tight_layout()
@@ -1118,7 +1196,7 @@ def label_grouped_bars(ax, bars, values, threshold):
             )
 
 
-def plot_system_cost_breakdown(cost_details, costs, output_dir):
+def plot_system_cost_breakdown(cost_details, costs, output_dir, case_axis=CAPACITY_AXIS):
     """Show cost groups plus generation, storage, and grid technologies."""
     matplotlib.use("Agg")
     import matplotlib.pyplot as plt
@@ -1150,10 +1228,11 @@ def plot_system_cost_breakdown(cost_details, costs, output_dir):
         ax.grid(axis="y", alpha=0.2)
         ax.set_axisbelow(True)
 
+    case_col = case_axis.column
     for year, group in cost_details.groupby("weather_year"):
-        cases = sorted(group.baseload_gw.unique())
+        cases = sorted(group[case_col].unique())
         categories = group.pivot_table(
-            index="baseload_gw", columns="category", values="total_cost_eur_per_year",
+            index=case_col, columns="category", values="total_cost_eur_per_year",
             aggfunc="sum", fill_value=0,
         ).reindex(index=cases, fill_value=0) / 1e9
         order = [name for name in colors if name in categories]
@@ -1161,7 +1240,7 @@ def plot_system_cost_breakdown(cost_details, costs, output_dir):
 
         generation = group.loc[group.category == "Electricity generation"]
         technologies = generation.pivot_table(
-            index="baseload_gw", columns="carrier", values="total_cost_eur_per_year",
+            index=case_col, columns="carrier", values="total_cost_eur_per_year",
             aggfunc="sum", fill_value=0,
         ).reindex(index=cases, fill_value=0) / 1e9
         ranking = technologies.abs().max().sort_values(ascending=False)
@@ -1176,7 +1255,7 @@ def plot_system_cost_breakdown(cost_details, costs, output_dir):
         ].copy()
         facilities["technology"] = facilities.category + ": " + facilities.carrier
         facility_values = facilities.pivot_table(
-            index="baseload_gw", columns="technology", values="total_cost_eur_per_year",
+            index=case_col, columns="technology", values="total_cost_eur_per_year",
             aggfunc="sum", fill_value=0,
         ).reindex(index=cases, fill_value=0) / 1e9
         facility_ranking = facility_values.abs().max().sort_values(ascending=False)
@@ -1188,7 +1267,7 @@ def plot_system_cost_breakdown(cost_details, costs, output_dir):
 
         fig, axes = plt.subplots(3, 1, figsize=(13, 12), sharex=True)
         stack(axes[0], categories, lambda name, _: colors[name])
-        year_costs = costs.loc[costs.weather_year == year].set_index("baseload_gw")
+        year_costs = costs.loc[costs.weather_year == year].set_index(case_col)
         axes[0].plot(np.arange(len(cases)),
                      year_costs.loc[cases, "system_cost_eur_per_year"] / 1e9,
                      "ko", markersize=3, label="Reported objective")
@@ -1210,8 +1289,8 @@ def plot_system_cost_breakdown(cost_details, costs, output_dir):
             axes[2].legend(loc="upper left", bbox_to_anchor=(1.01, 1), fontsize=8)
         axes[2].set(title="Storage and infrastructure cost by technology",
                     ylabel="Billion EUR/year",
-                    xlabel="Added baseload capacity (GW)")
-        axes[2].set_xticks(np.arange(len(cases)), [f"{case:g}" for case in cases])
+                    xlabel=case_axis.xlabel)
+        axes[2].set_xticks(np.arange(len(cases)), case_axis.ticks(cases))
         fig.text(0.02, 0.01,
                  "Objective costs: new investment and operation; existing fixed assets' "
                  "capital costs are excluded. Full carrier detail is in system_cost_breakdown.csv.",
@@ -1221,7 +1300,8 @@ def plot_system_cost_breakdown(cost_details, costs, output_dir):
         plt.close(fig)
 
 
-def plot_capacity_changes(capacities, output_dir, case_steps, top_carriers=12):
+def plot_capacity_changes(capacities, output_dir, case_steps, top_carriers=12,
+                          case_axis=CAPACITY_AXIS):
     matplotlib.use("Agg")
     import matplotlib.pyplot as plt
 
@@ -1249,7 +1329,7 @@ def plot_capacity_changes(capacities, output_dir, case_steps, top_carriers=12):
             continue
 
         values = group.pivot(
-            index="carrier", columns="baseload_gw", values="delta_vs_baseline"
+            index="carrier", columns=case_axis.column, values="delta_vs_baseline"
         ).reindex(index=selected, columns=case_steps)
         limit = values.abs().max().max()
         cmap = plt.get_cmap("RdBu_r").copy()
@@ -1262,9 +1342,9 @@ def plot_capacity_changes(capacities, output_dir, case_steps, top_carriers=12):
             vmin=-limit,
             vmax=limit,
         )
-        ax.set_xticks(range(len(case_steps)), case_steps)
+        ax.set_xticks(range(len(case_steps)), case_axis.ticks(case_steps))
         ax.set_yticks(range(len(selected)), selected)
-        ax.set(xlabel="Added baseload capacity (GW)")
+        ax.set(xlabel=case_axis.xlabel)
         ax.set_title(f"{year}: {component} capacity change vs 0 GW ({basis})")
         fig.colorbar(image, ax=ax, label=f"Change in installed capacity ({unit})")
         fig.tight_layout()
@@ -1272,7 +1352,7 @@ def plot_capacity_changes(capacities, output_dir, case_steps, top_carriers=12):
         plt.close(fig)
 
 
-def plot_link_capacities(capacities, output_dir):
+def plot_link_capacities(capacities, output_dir, case_axis=CAPACITY_AXIS):
     """Plot all installed Link capacities, with electrolysis highlighted."""
     matplotlib.use("Agg")
     import matplotlib.pyplot as plt
@@ -1288,7 +1368,8 @@ def plot_link_capacities(capacities, output_dir):
             return f"{value:,.1f}"
         return f"{value:,.3f}"
 
-    for (year, baseload_gw), group in links.groupby(["weather_year", "baseload_gw"]):
+    case_col = case_axis.column
+    for (year, case), group in links.groupby(["weather_year", case_col]):
         values = group.groupby("carrier").installed_capacity.sum()
         electrolyzer = values.index.str.contains("electrolys", case=False, regex=False)
         values = values.loc[(values > 1e-3) | electrolyzer].sort_values()
@@ -1310,7 +1391,7 @@ def plot_link_capacities(capacities, output_dir):
             )
         ax.set_xlim(0, maximum * 1.16)
         ax.set(
-            title=f"{year}: Link capacity with {baseload_gw:g} GW baseload",
+            title=f"{year}: Link capacity ({case_axis.label(case)})",
             xlabel="Installed Link input capacity at bus0 (model units / 1,000)",
         )
         ax.grid(axis="x", alpha=0.2)
@@ -1321,17 +1402,17 @@ def plot_link_capacities(capacities, output_dir):
             fontsize=8,
         )
         fig.tight_layout(rect=(0, 0.02, 1, 1))
-        fig.savefig(output_dir / f"link_capacities_{year}_b{baseload_gw:g}.png", dpi=160,
+        fig.savefig(output_dir / f"link_capacities_{year}_{case_axis.file_suffix(case)}.png", dpi=160,
                     bbox_inches="tight")
         plt.close(fig)
 
     for year, group in links.groupby("weather_year"):
-        cases = sorted(group.baseload_gw.unique())
+        cases = sorted(group[case_col].unique())
         electrolyzer = group.loc[
             group.carrier.str.contains("electrolys", case=False, regex=False)
         ]
         values = (
-            electrolyzer.groupby("baseload_gw").installed_capacity.sum()
+            electrolyzer.groupby(case_col).installed_capacity.sum()
             .reindex(cases, fill_value=0)
         )
         fig, ax = plt.subplots(figsize=(max(6, len(cases) * 1.1), 4.5))
@@ -1343,10 +1424,10 @@ def plot_link_capacities(capacities, output_dir):
                 bar.get_x() + bar.get_width() / 2, value + maximum * 0.015,
                 capacity_label(value), ha="center", va="bottom", fontsize=9,
             )
-        ax.set_xticks(range(len(cases)), [f"{case:g}" for case in cases])
+        ax.set_xticks(range(len(cases)), case_axis.ticks(cases))
         ax.set(
             title=f"{year}: installed electrolyzer capacity",
-            xlabel="Added baseload capacity (GW)",
+            xlabel=case_axis.xlabel,
             ylabel="Electrolyzer electricity-input capacity (GW)",
         )
         ax.grid(axis="y", alpha=0.2)
@@ -1356,13 +1437,14 @@ def plot_link_capacities(capacities, output_dir):
         plt.close(fig)
 
 
-def plot_stacked_carriers(table, value, cases, title, ylabel, output_file, demand=None):
+def plot_stacked_carriers(table, value, cases, title, ylabel, output_file, demand=None,
+                          case_axis=CAPACITY_AXIS):
     import matplotlib.pyplot as plt
 
     if table.empty:
         return
     values = table.pivot_table(
-        index="baseload_gw", columns="carrier", values=value,
+        index=case_axis.column, columns="carrier", values=value,
         aggfunc="sum", fill_value=0,
     ).reindex(index=cases, fill_value=0)
     values = values.loc[:, values.max().sort_values(ascending=False).index]
@@ -1385,8 +1467,8 @@ def plot_stacked_carriers(table, value, cases, title, ylabel, output_file, deman
     if demand is not None:
         ax.plot(range(len(cases)), demand.reindex(cases), "ko--",
                 linewidth=1.3, markersize=4, label="Heat load at district bus")
-    ax.set_xticks(range(len(cases)), [f"{case:g}" for case in cases])
-    ax.set(xlabel="Added baseload capacity (GW)", ylabel=ylabel, title=title)
+    ax.set_xticks(range(len(cases)), case_axis.ticks(cases))
+    ax.set(xlabel=case_axis.xlabel, ylabel=ylabel, title=title)
     ax.grid(axis="y", alpha=0.2)
     ax.legend(loc="upper left", bbox_to_anchor=(1.01, 1), fontsize=8)
     fig.tight_layout()
@@ -1394,19 +1476,20 @@ def plot_stacked_carriers(table, value, cases, title, ylabel, output_file, deman
     plt.close(fig)
 
 
-def plot_electric_generation(generation, output_dir):
+def plot_electric_generation(generation, output_dir, case_axis=CAPACITY_AXIS):
     import matplotlib.pyplot as plt
 
     for year, group in generation.groupby("weather_year"):
-        cases = sorted(group.baseload_gw.unique())
+        cases = sorted(group[case_axis.column].unique())
         plot_stacked_carriers(
             group, "installed_capacity_gw_e", cases,
             f"{year}: installed electricity-generation capacity",
             "Installed electrical capacity (GW)",
             output_dir / f"generation_capacity_stacked_{year}.png",
+            case_axis=case_axis,
         )
         values = group.pivot_table(
-            index="carrier", columns="baseload_gw",
+            index="carrier", columns=case_axis.column,
             values="installed_capacity_gw_e", aggfunc="sum", fill_value=0,
         ).reindex(columns=cases, fill_value=0)
         values = values.loc[values.max(axis=1).sort_values(ascending=False).index]
@@ -1419,26 +1502,26 @@ def plot_electric_generation(generation, output_dir):
         peak = values.to_numpy().max()
         for i, capacity in enumerate(cases):
             bars = ax.bar(x + (i - (len(cases) - 1) / 2) * width,
-                          values[capacity], width=width, label=f"{capacity:g} GW")
+                          values[capacity], width=width, label=case_axis.label(capacity))
             label_grouped_bars(ax, bars, values[capacity], max(40, 0.04 * peak))
         ax.set_ylim(0, peak * 1.22)
         ax.set_xticks(x, values.index, rotation=45, ha="right")
         ax.set(ylabel="Installed electrical capacity (GW)",
                title=f"{year}: generation technologies by baseload scenario")
         ax.grid(axis="y", alpha=0.2)
-        ax.legend(title="Added baseload")
+        ax.legend(title=case_axis.legend_title)
         fig.tight_layout()
         fig.savefig(output_dir / f"generation_capacity_grouped_{year}.png", dpi=160)
         plt.close(fig)
 
 
-def plot_electricity_generated(energy, output_dir):
+def plot_electricity_generated(energy, output_dir, case_axis=CAPACITY_AXIS):
     import matplotlib.pyplot as plt
 
     for year, group in energy.groupby("weather_year"):
-        cases = sorted(group.baseload_gw.unique())
+        cases = sorted(group[case_axis.column].unique())
         values = group.pivot_table(
-            index="carrier", columns="baseload_gw", values="generation_twh",
+            index="carrier", columns=case_axis.column, values="generation_twh",
             aggfunc="sum", fill_value=0,
         ).reindex(columns=cases, fill_value=0)
         values = values.loc[values.max(axis=1).sort_values(ascending=False).index]
@@ -1451,7 +1534,7 @@ def plot_electricity_generated(energy, output_dir):
         peak = values.to_numpy().max()
         for i, capacity in enumerate(cases):
             bars = ax.bar(x + (i - (len(cases) - 1) / 2) * width,
-                          values[capacity], width=width, label=f"{capacity:g} GW")
+                          values[capacity], width=width, label=case_axis.label(capacity))
             label_grouped_bars(ax, bars, values[capacity], max(20, 0.04 * peak))
         ax.set_ylim(0, peak * 1.22)
         ax.set_xticks(x, values.index, rotation=45, ha="right")
@@ -1459,20 +1542,20 @@ def plot_electricity_generated(energy, output_dir):
                title=f"{year}: electricity output by technology",
                xlabel="Technology")
         ax.grid(axis="y", alpha=0.2)
-        ax.legend(title="Added baseload")
+        ax.legend(title=case_axis.legend_title)
         fig.tight_layout()
         fig.savefig(output_dir / f"electricity_generation_{year}.png", dpi=160)
         plt.close(fig)
 
 
-def plot_renewable_curtailment(curtailment, output_dir):
+def plot_renewable_curtailment(curtailment, output_dir, case_axis=CAPACITY_AXIS):
     """Show annual curtailed electricity by weather-dependent source."""
     import matplotlib.pyplot as plt
 
     for year, group in curtailment.groupby("weather_year"):
-        cases = sorted(group.baseload_gw.unique())
+        cases = sorted(group[case_axis.column].unique())
         values = group.pivot_table(
-            index="baseload_gw", columns="carrier", values="curtailed_twh",
+            index=case_axis.column, columns="carrier", values="curtailed_twh",
             aggfunc="sum", fill_value=0,
         ).reindex(index=cases, fill_value=0)
         values = values.loc[:, values.max().sort_values(ascending=False).index]
@@ -1494,10 +1577,10 @@ def plot_renewable_curtailment(curtailment, output_dir):
             ax.text(case_index, total + maximum * 0.015, f"{total:,.0f}",
                     ha="center", va="bottom", fontsize=9)
         ax.set_ylim(0, maximum * 1.16)
-        ax.set_xticks(range(len(cases)), [f"{case:g}" for case in cases])
+        ax.set_xticks(range(len(cases)), case_axis.ticks(cases))
         ax.set(
             title=f"{year}: renewable electricity curtailment by source",
-            xlabel="Added baseload capacity (GW)",
+            xlabel=case_axis.xlabel,
             ylabel="Curtailed electricity (TWh/year)",
         )
         ax.grid(axis="y", alpha=0.2)
@@ -1512,19 +1595,23 @@ def plot_renewable_curtailment(curtailment, output_dir):
         plt.close(fig)
 
 
-def plot_sector_final_energy_demand(demand, energy, output_dir):
+def plot_sector_final_energy_demand(demand, energy, output_dir, case_axis=CAPACITY_AXIS):
     import matplotlib.pyplot as plt
 
+    case_col = case_axis.column
     for year, group in demand.groupby("weather_year"):
-        baseline = 0 if 0 in group.baseload_gw.values else group.baseload_gw.min()
-        values = group.loc[group.baseload_gw == baseline].groupby("sector").demand_twh.sum()
+        reference = group[case_col].min()
+        values = group.loc[group[case_col] == reference].groupby("sector").demand_twh.sum()
         values = values.reindex(["Transport", "Heating", "Industry"], fill_value=0)
         baseload = energy.loc[
             (energy.weather_year == year) & (energy.carrier == "baseload_candidate")
-        ].sort_values("baseload_gw")
+        ].sort_values(case_col)
         if not baseload.empty:
             largest = baseload.iloc[-1]
-            values.loc[f"Baseload {largest.baseload_gw:g} GW\n(electricity supply)"] = (
+            label = case_axis.label(largest[case_col])
+            if case_axis == CAPACITY_FACTOR_AXIS:
+                label = f"{largest.baseload_gw:g} GW at {label}"
+            values.loc[f"Baseload {label}\n(electricity supply)"] = (
                 largest.generation_twh
             )
 
@@ -1547,7 +1634,7 @@ def plot_sector_final_energy_demand(demand, energy, output_dir):
         plt.close(fig)
 
 
-def plot_sector_load_profiles(profiles, output_dir):
+def plot_sector_load_profiles(profiles, output_dir, case_axis=CAPACITY_AXIS):
     import matplotlib.pyplot as plt
 
     colors = {
@@ -1561,9 +1648,9 @@ def plot_sector_load_profiles(profiles, output_dir):
         for sector, color in colors.items():
             ax.plot(group.Time, group[sector], color=color, linewidth=0.75,
                     label=sector)
-        capacity = group.baseload_gw.iloc[0]
+        case = case_axis.label(group[case_axis.column].iloc[0])
         ax.set(
-            title=f"{year}: Europe-wide load by sector ({capacity:g} GW baseload case)",
+            title=f"{year}: Europe-wide load by sector ({case} baseload case)",
             xlabel="Time",
             ylabel="Load (GW)",
         )
@@ -1575,9 +1662,10 @@ def plot_sector_load_profiles(profiles, output_dir):
         plt.close(fig)
 
 
-def plot_baseload_siting(nodes, countries, output_dir):
+def plot_baseload_siting(nodes, countries, output_dir, case_axis=CAPACITY_AXIS):
     import matplotlib.pyplot as plt
 
+    case_col = case_axis.column
     for table, label, limit in ((countries, "countries", None), (nodes, "nodes", 30)):
         for year, group in table.groupby("weather_year"):
             if label == "nodes":
@@ -1586,10 +1674,10 @@ def plot_baseload_siting(nodes, countries, output_dir):
             else:
                 group = group.rename(columns={"country": "location"})
             values = group.pivot_table(
-                index="location", columns="baseload_gw",
+                index="location", columns=case_col,
                 values="installed_capacity_gw", aggfunc="sum", fill_value=0,
             )
-            values = values.reindex(columns=sorted(group.baseload_gw.unique()), fill_value=0)
+            values = values.reindex(columns=sorted(group[case_col].unique()), fill_value=0)
             values = values.loc[values.max(axis=1).sort_values(ascending=False).index]
             values = values.loc[values.max(axis=1) >= 0.01]
             if limit is not None:
@@ -1600,9 +1688,9 @@ def plot_baseload_siting(nodes, countries, output_dir):
                                             max(4, len(values) * 0.28 + 1.5)))
             image = ax.imshow(values, aspect="auto", cmap="viridis")
             ax.set_xticks(range(len(values.columns)),
-                          [f"{capacity:g}" for capacity in values.columns])
+                          case_axis.ticks(values.columns))
             ax.set_yticks(range(len(values)), values.index)
-            ax.set(xlabel="Added baseload capacity (GW)",
+            ax.set(xlabel=case_axis.xlabel,
                    title=f"{year}: experimental baseload capacity by {label}")
             if label == "countries":
                 for row, capacities in enumerate(values.to_numpy()):
@@ -1617,31 +1705,34 @@ def plot_baseload_siting(nodes, countries, output_dir):
             plt.close(fig)
 
 
-def plot_district_heating(assets, summaries, output_dir):
+def plot_district_heating(assets, summaries, output_dir, case_axis=CAPACITY_AXIS):
     import matplotlib.pyplot as plt
 
     if assets.empty or summaries.empty:
         return
+    case_col = case_axis.column
     for year, group in assets.groupby("weather_year"):
-        cases = sorted(group.baseload_gw.unique())
+        cases = sorted(group[case_col].unique())
         supply = group.loc[
             group.role.isin(["heat_supply", "chp_heat", "process_heat"])
         ]
         demand = summaries.loc[
             summaries.weather_year == year
-        ].set_index("baseload_gw").heat_at_bus_twh_th
+        ].set_index(case_col).heat_at_bus_twh_th
         plot_stacked_carriers(
             supply, "heat_injected_twh_th", cases,
             f"{year}: heat injected into district heating",
             "Annual heat (TWh thermal)",
             output_dir / f"district_heating_generation_{year}.png",
             demand=demand,
+            case_axis=case_axis,
         )
         plot_stacked_carriers(
             supply, "installed_heat_output_capacity_gw_th", cases,
             f"{year}: district-heat production capacity",
             "Installed heat output at mean efficiency (GW thermal)",
             output_dir / f"district_heating_capacity_{year}.png",
+            case_axis=case_axis,
         )
         dedicated = group.loc[group.cost_scope == "district_heat_only"]
         plot_stacked_carriers(
@@ -1649,10 +1740,11 @@ def plot_district_heating(assets, summaries, output_dir):
             f"{year}: dedicated district-heat asset costs",
             "Annualized fixed + own variable cost (billion EUR/year)",
             output_dir / f"district_heating_direct_cost_{year}.png",
+            case_axis=case_axis,
         )
         year_summary = summaries.loc[
             summaries.weather_year == year
-        ].set_index("baseload_gw").reindex(cases)
+        ].set_index(case_col).reindex(cases)
         fig, axes = plt.subplots(1, 2, figsize=(10, 4))
         storage_values = year_summary.thermal_storage_capacity_gwh_th.to_numpy()
         bars = axes[0].bar(range(len(cases)), storage_values)
@@ -1666,8 +1758,8 @@ def plot_district_heating(assets, summaries, output_dir):
         axes[1].set(ylabel="Annual heat (TWh)", title="Storage operation")
         axes[1].legend()
         for ax in axes:
-            ax.set_xticks(range(len(cases)), [f"{case:g}" for case in cases])
-            ax.set(xlabel="Added baseload capacity (GW)")
+            ax.set_xticks(range(len(cases)), case_axis.ticks(cases))
+            ax.set(xlabel=case_axis.xlabel)
             ax.grid(axis="y", alpha=0.2)
         fig.tight_layout()
         fig.savefig(output_dir / f"district_heating_storage_{year}.png", dpi=160)
@@ -1694,29 +1786,73 @@ def main():
         type=float,
         help="Expected GW cases; show gaps for missing networks (default: loaded cases)",
     )
+    parser.add_argument(
+        "--by-capacity-factor",
+        action="store_true",
+        help="Compare fixed-capacity networks named *_b<GW>_cf<percent>.nc",
+    )
+    parser.add_argument(
+        "--expected-capacity-factors",
+        nargs="+",
+        type=int,
+        help="Expected capacity factors in percent; show gaps for missing cases",
+    )
+    parser.add_argument(
+        "--baseline",
+        type=Path,
+        help="Matching solved *_b0.nc reference for a capacity-factor comparison",
+    )
     args = parser.parse_args()
+
+    if args.by_capacity_factor:
+        if args.expected_capacities is not None:
+            parser.error("Use --expected-capacity-factors with --by-capacity-factor")
+        if any(not 0 <= cf <= 100 for cf in args.expected_capacity_factors or []):
+            parser.error("Expected capacity factors must be between 0 and 100 percent")
+        case_axis = CAPACITY_FACTOR_AXIS
+        expected_cases = args.expected_capacity_factors
+    else:
+        if args.baseline or args.expected_capacity_factors is not None:
+            parser.error("--baseline and --expected-capacity-factors require --by-capacity-factor")
+        case_axis = CAPACITY_AXIS
+        expected_cases = args.expected_capacities
+
+    network_files = find_networks(args.inputs, case_axis)
+    if args.baseline:
+        match = CAPACITY_IN_FILENAME.search(args.baseline.name)
+        if not args.baseline.is_file() or match is None or float(match["gw"]) != 0:
+            parser.error("--baseline must point to an existing solved *_b0.nc network")
+        network_files.insert(0, args.baseline.resolve())
 
     (costs, cost_details, capacities, generation, energy, curtailment, demand, profiles,
      baseload_nodes, baseload_countries,
-     heat_assets, heat_loads, heat_summary) = compare(find_networks(args.inputs))
-    case_steps = (
-        sorted(set(args.expected_capacities))
-        if args.expected_capacities is not None
-        else sorted(costs.baseload_gw.unique())
-    )
+     heat_assets, heat_loads, heat_summary) = compare(network_files, case_axis)
+    case_col = case_axis.column
+    case_steps = set(expected_cases if expected_cases is not None else costs[case_col])
+    if args.baseline:
+        case_steps.add(case_axis.baseline)
+    case_steps = sorted(case_steps)
     for year, group in costs.groupby("weather_year"):
-        missing = sorted(set(case_steps) - set(group.baseload_gw))
+        missing = sorted(set(case_steps) - set(group[case_col]))
         if missing:
-            print(f"Weather {year}: missing baseload cases {missing} GW")
+            print(f"Weather {year}: missing baseload cases {', '.join(map(case_axis.label, missing))}")
+
     args.output_dir.mkdir(parents=True, exist_ok=True)
-    costs.to_csv(args.output_dir / "system_costs.csv", index=False)
-    cost_details.to_csv(args.output_dir / "system_cost_breakdown.csv", index=False)
-    capacities.to_csv(args.output_dir / "installed_capacities.csv", index=False)
-    generation.to_csv(args.output_dir / "generation_capacities.csv", index=False)
-    energy.to_csv(args.output_dir / "electricity_generation_twh.csv", index=False)
-    curtailment.to_csv(args.output_dir / "renewable_curtailment_twh.csv", index=False)
-    demand.to_csv(args.output_dir / "sector_final_energy_demand_twh.csv", index=False)
-    profiles.to_csv(args.output_dir / "sector_load_profile_gw.csv", index=False)
+
+    def write_csv(table, name):
+        if args.by_capacity_factor and case_col in table:
+            factors = table[case_col].astype("Int64")
+            table = table.assign(**{case_col: factors.mask(factors == case_axis.baseline)})
+        table.to_csv(args.output_dir / name, index=False)
+
+    write_csv(costs, "system_costs.csv")
+    write_csv(cost_details, "system_cost_breakdown.csv")
+    write_csv(capacities, "installed_capacities.csv")
+    write_csv(generation, "generation_capacities.csv")
+    write_csv(energy, "electricity_generation_twh.csv")
+    write_csv(curtailment, "renewable_curtailment_twh.csv")
+    write_csv(demand, "sector_final_energy_demand_twh.csv")
+    write_csv(profiles, "sector_load_profile_gw.csv")
     (args.output_dir / "sector_final_energy_demand_notes.txt").write_text(
         "Annual demand uses snapshot-weighted solved dispatch in TWh.\n"
         "Transport includes land-transport oil, aviation kerosene, shipping oil "
@@ -1737,22 +1873,22 @@ def main():
         "all lines are snapshot power in GW.\n",
         encoding="utf-8",
     )
-    baseload_nodes.to_csv(args.output_dir / "baseload_siting_nodes.csv", index=False)
-    baseload_countries.to_csv(args.output_dir / "baseload_siting_countries.csv", index=False)
-    heat_assets.to_csv(args.output_dir / "district_heating_technologies.csv", index=False)
-    heat_loads.to_csv(args.output_dir / "district_heating_loads.csv", index=False)
-    heat_summary.to_csv(args.output_dir / "district_heating_summary.csv", index=False)
-    plot_costs(costs, args.output_dir / "system_costs.png", case_steps)
-    plot_system_cost_breakdown(cost_details, costs, args.output_dir)
-    plot_capacity_changes(capacities, args.output_dir, case_steps)
-    plot_link_capacities(capacities, args.output_dir)
-    plot_electric_generation(generation, args.output_dir)
-    plot_electricity_generated(energy, args.output_dir)
-    plot_renewable_curtailment(curtailment, args.output_dir)
-    plot_sector_final_energy_demand(demand, energy, args.output_dir)
-    plot_sector_load_profiles(profiles, args.output_dir)
-    plot_baseload_siting(baseload_nodes, baseload_countries, args.output_dir)
-    plot_district_heating(heat_assets, heat_summary, args.output_dir)
+    write_csv(baseload_nodes, "baseload_siting_nodes.csv")
+    write_csv(baseload_countries, "baseload_siting_countries.csv")
+    write_csv(heat_assets, "district_heating_technologies.csv")
+    write_csv(heat_loads, "district_heating_loads.csv")
+    write_csv(heat_summary, "district_heating_summary.csv")
+    plot_costs(costs, args.output_dir / "system_costs.png", case_steps, case_axis)
+    plot_system_cost_breakdown(cost_details, costs, args.output_dir, case_axis)
+    plot_capacity_changes(capacities, args.output_dir, case_steps, case_axis=case_axis)
+    plot_link_capacities(capacities, args.output_dir, case_axis)
+    plot_electric_generation(generation, args.output_dir, case_axis)
+    plot_electricity_generated(energy, args.output_dir, case_axis)
+    plot_renewable_curtailment(curtailment, args.output_dir, case_axis)
+    plot_sector_final_energy_demand(demand, energy, args.output_dir, case_axis)
+    plot_sector_load_profiles(profiles, args.output_dir, case_axis)
+    plot_baseload_siting(baseload_nodes, baseload_countries, args.output_dir, case_axis)
+    plot_district_heating(heat_assets, heat_summary, args.output_dir, case_axis)
     (args.output_dir / "district_heating_notes.txt").write_text(
         "District heating means buses with carrier 'urban central heat'.\n"
         "Heat at bus includes every load attached to those buses, including low-temperature "

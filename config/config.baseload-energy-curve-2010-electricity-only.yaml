@@ -1,0 +1,8 @@
+# Add after config.baseload-energy-curve-2010.yaml for the paired 90% CF case.
+baseload_experiment:
+  district_heat:
+    enabled: false
+
+baseload_energy_curve:
+  capacity_factors_percent: [90]
+  output_dir: baseload-electricity-only-cf90-full-availability

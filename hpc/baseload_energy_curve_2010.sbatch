@@ -24,7 +24,6 @@ esac
 for input_file in \
     resources/weather-2010/networks/base_s_128___2050.nc \
     resources/weather-2010/costs_2050.csv \
-    data/nuclear_p_max_pu.csv \
     results/weather-2010/baseload-chp-free-opex/metrics/base_s_128___2050_b0.csv; do
     if [[ ! -r "$input_file" ]]; then
         echo "Missing input: $input_file" >&2
@@ -62,7 +61,7 @@ if [[ ! -r "$GRB_LICENSE_FILE" ]]; then
     exit 1
 fi
 
-target="results/weather-2010/baseload-chp-energy-curve/metrics/base_s_128___2050_b300_cf${cf_percent}.csv"
+target="results/weather-2010/baseload-chp-energy-curve-full-availability/metrics/base_s_128___2050_b300_cf${cf_percent}.csv"
 echo "Solving fixed 300 GW, target CF ${cf_percent}%, on ${SLURM_JOB_NODELIST:-unknown node}"
 
 # Array tasks write distinct outputs; disable Snakemake's repository-wide lock.
